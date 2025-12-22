@@ -1283,7 +1283,6 @@ class KoprolAutomation {
 
     await this.driver.sleep(500);
 
-    // Sementara: fungsi due date belum diimplementasikan penuh, hindari error TypeError
     if (typeof this.setFutureDueDate === "function") {
       try {
         await this.setFutureDueDate({
@@ -1311,6 +1310,49 @@ class KoprolAutomation {
 
     await this.driver.sleep(1000);
     return true;
+  }
+
+  async setFutureDueDate() {
+    // Buka dialog Set Due Date dan langsung klik Save/Simpan.
+    // Logika perhitungan tanggal future dibiarkan ke Koprol (wizard default).
+    await this.dismissAnyModal(2000);
+
+    const clicked = await this.clickSetDueDateButton();
+    if (!clicked) {
+      throw new Error("Tombol Set Due Date tidak ditemukan");
+    }
+
+    try {
+      await this.driver
+        .wait(until.elementLocated(By.css(".modal-content")), 5000)
+        .catch(() => {});
+    } catch (e) {}
+
+    let modal;
+    try {
+      modal = await this.getLatestModal();
+    } catch (e) {
+      throw new Error("Dialog Set Due Date tidak muncul");
+    }
+
+    let saved = false;
+    for (const label of ["Save", "Simpan"]) {
+      if (saved) break;
+      try {
+        await this.clickButtonInModal(modal, label);
+        saved = true;
+        break;
+      } catch (e) {}
+    }
+
+    if (!saved) {
+      throw new Error("Tombol Save pada dialog Set Due Date tidak ditemukan");
+    }
+
+    try {
+      await this.driver.wait(until.stalenessOf(modal), 5000);
+    } catch (e) {}
+    await this.driver.sleep(400);
   }
 
   async ensureRequestFormListReady() {
@@ -1726,7 +1768,7 @@ class KoprolAutomation {
     try {
       row = await modal.findElement(
         By.xpath(
-          `.//tr[.//*[self::td or self::th or self::span or self::label][contains(normalize-space(.), '${labelText}')]]`
+          `.//tr[.//*[self::td or self::th or self::label or self::span][contains(normalize-space(.), '${labelText}')]]`
         )
       );
     } catch (e) {
