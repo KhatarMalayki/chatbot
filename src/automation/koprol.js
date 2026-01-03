@@ -11,9 +11,13 @@ const {
 } = require("../utils/ticketAnalysis");
 
 class KoprolAutomation {
-  constructor() {
+  constructor(options = {}) {
     this.driver = null;
     this.isLoggedIn = false;
+
+    // Kredensial default dari config, bisa dioverride per-instance (misal per user WA)
+    this.username = options.username || config.koprol.username;
+    this.password = options.password || config.koprol.password;
   }
 
   xpathLiteral(text = "") {
@@ -209,6 +213,12 @@ class KoprolAutomation {
         await this.initialize();
       }
 
+      if (!this.username || !this.password) {
+        throw new Error(
+          "Kredensial Koprol tidak lengkap. Pastikan username dan password sudah diisi."
+        );
+      }
+
       logger.info(`Navigating to ${config.koprol.url}/web/login`);
       await this.driver.get(`${config.koprol.url}/web/login`);
 
@@ -249,25 +259,45 @@ class KoprolAutomation {
       }
 
       await emailField.clear();
-      await emailField.sendKeys(config.koprol.username);
+      await emailField.sendKeys(this.username);
       await passwordField.clear();
-      await passwordField.sendKeys(config.koprol.password);
+      await passwordField.sendKeys(this.password);
 
-      // Click login button (avoid :contains which is invalid in CSS)
-      let loginButton;
+      // Trigger submit via ENTER on password to reduce chance of not logging in
       try {
+        await passwordField.sendKeys(Key.RETURN);
+        await this.driver.sleep(300);
+      } catch (e) {}
+
+      // Optional: click login button if we can find it (but don't fail if not found)
+      let loginButton = null;
+      try {
+        // Common case: submit button element
         loginButton = await this.driver.findElement(
-          By.css('button[type="submit"]')
+          By.css('button[type="submit"], input[type="submit"]')
         );
       } catch (e3) {
-        loginButton = await this.driver.findElement(
-          By.xpath(
-            "//button[contains(., 'Log in') or contains(., 'Login') or contains(., 'Sign in')]"
-          )
-        );
+        try {
+          // Fallback: any button with Login/Sign in text
+          loginButton = await this.driver.findElement(
+            By.xpath(
+              "//button[contains(normalize-space(.), 'Log in') or contains(normalize-space(.), 'Login') or contains(normalize-space(.), 'Sign in')]"
+            )
+          );
+        } catch (e4) {
+          // If button truly not found, rely solely on ENTER we already sent
+          logger.warn('Login button not found, relying on ENTER key for submit');
+        }
       }
-      await loginButton.click();
-      await this.driver.sleep(1000);
+
+      if (loginButton) {
+        try {
+          await loginButton.click();
+          await this.driver.sleep(1000);
+        } catch (e) {
+          logger.warn('Click on login button failed, relying on ENTER submit', e.message || e);
+        }
+      }
 
       // Wait until we are no longer on the login page and backend UI is visible
       const loginTimeoutMs = 20000;
@@ -296,7 +326,9 @@ class KoprolAutomation {
       return true;
     } catch (error) {
       logger.error("Login failed", error);
-      throw new Error("Gagal login ke Koprol. Periksa kredensial di .env");
+      throw new Error(
+        "Gagal login ke Koprol. Periksa kembali kredensial Koprol yang diberikan."
+      );
     }
   }
 
@@ -387,6 +419,19 @@ class KoprolAutomation {
       await this.driver.sleep(150);
     }
     return true;
+  }
+
+  async scrollIntoView(element) {
+    if (!this.driver || !element) {
+      return;
+    }
+    try {
+      await this.driver.executeScript(
+        "if (arguments[0] && arguments[0].scrollIntoView) { arguments[0].scrollIntoView({behavior:'instant', block:'center', inline:'nearest'}); }",
+        element
+      );
+      await this.driver.sleep(200);
+    } catch (e) {}
   }
 
   async waitForPageReady() {
@@ -723,7 +768,6 @@ class KoprolAutomation {
       throw new Error("WebDriver belum siap");
     }
     const outstandingUrl = `${config.koprol.url}/web#action=428&model=eps.request.form.line&view_type=list&menu_id=301`;
-    const maxAttempts = 2;
     const listSelectors = [
       "table.o_list_table",
       ".o_list_view table.o_list_table",
@@ -737,10 +781,70 @@ class KoprolAutomation {
       ".o_blockUI",
       ".o_dialog_container .o_spinner",
     ];
+    
+    // Helper: buka Outstanding lewat menu Request Form (tanpa direct URL)
+    const openViaMenu = async () => {
+      try {
+        logger.info("Opening Outstanding Task list via Request Form app menu");
 
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        // 1) Buka aplikasi Request Form dari app switcher/menu
+        await this.openRequestFormApp();
+        try {
+          await this.waitForUrlContains("model=eps.request.form", 12000);
+        } catch (e) {}
+        await this.waitForPageReady();
+
+        // 2) Cari dan klik menu/tab "Outstanding Task" di navbar atas
+        const menuXPaths = [
+          "//div[contains(@class,'o_main_navbar')]//a[normalize-space(.)='Outstanding Task']",
+          "//div[contains(@class,'o_main_navbar')]//a[contains(normalize-space(.),'Outstanding Task')]",
+          "//nav//a[normalize-space(.)='Outstanding Task']",
+          "//nav//a[contains(normalize-space(.),'Outstanding Task')]",
+        ];
+        let clicked = false;
+        for (const xp of menuXPaths) {
+          const items = await this.driver.findElements(By.xpath(xp));
+          if (items.length) {
+            try {
+              await this.scrollIntoView(items[0]).catch(() => {});
+              await items[0].click();
+              clicked = true;
+              break;
+            } catch (e) {}
+          }
+        }
+
+        if (!clicked) {
+          throw new Error("Menu Outstanding Task tidak ditemukan di navbar");
+        }
+
+        // 3) Tunggu sampai berpindah ke model eps.request.form.line (Outstanding Task list)
+        try {
+          await this.waitForUrlContains("model=eps.request.form.line", 12000);
+        } catch (e) {}
+        await this.waitForPageReady();
+        await this.waitUntilSelectorsGone(blockingSelectors, 12000);
+
+        const listElement = await this.waitForAnyCss(listSelectors, 12000);
+        if (listElement) {
+          try {
+            await this.scrollIntoView(listElement);
+          } catch (e) {}
+        }
+        await this.driver.sleep(400);
+        return true;
+      } catch (e) {
+        logger.warn("Outstanding Task navigation via menu failed", {
+          message: e.message,
+        });
+        return false;
+      }
+    };
+
+    // Helper: fallback lama menggunakan direct URL (dipakai jika menu gagal)
+    const openViaDirectUrl = async () => {
       logger.info(
-        `Opening Outstanding Task list (attempt ${attempt}): ${outstandingUrl}`
+        `Opening Outstanding Task list via direct URL: ${outstandingUrl}`
       );
       await this.driver.get(outstandingUrl);
 
@@ -748,7 +852,6 @@ class KoprolAutomation {
         await this.waitForPageReady();
         await this.waitUntilSelectorsGone(blockingSelectors, 12000);
 
-        // Occasionally a modal (e.g., warning) blocks the list. Close generic modals if present.
         const modals = await this.driver.findElements(By.css(".modal-content"));
         if (modals.length) {
           for (const modal of modals) {
@@ -768,7 +871,7 @@ class KoprolAutomation {
           );
         }
 
-        const listElement = await this.waitForAnyCss(listSelectors, 25000);
+        const listElement = await this.waitForAnyCss(listSelectors, 12000);
         if (listElement) {
           try {
             await this.scrollIntoView(listElement);
@@ -777,11 +880,65 @@ class KoprolAutomation {
         await this.driver.sleep(400);
         return true;
       } catch (e) {
-        logger.warn("Outstanding Task list failed to load", {
+        logger.warn("Outstanding Task list failed to load via direct URL", {
           message: e.message,
         });
+        return false;
       }
+    };
+
+    // 1) Coba lewat menu Request Form -> Outstanding Task terlebih dahulu
+    const viaMenuOk = await openViaMenu();
+    if (viaMenuOk) {
+      return true;
     }
+
+    // 2) Jika gagal, fallback satu kali ke direct URL (beserta snapshot + screenshot bila tetap gagal)
+    const viaDirectOk = await openViaDirectUrl();
+    if (viaDirectOk) {
+      return true;
+    }
+
+    // 3) Diagnosa terakhir + screenshot, lalu error seperti sebelumnya
+    try {
+      await this.driver.sleep(2000);
+
+      let url = "";
+      try {
+        url = await this.driver.getCurrentUrl();
+      } catch (err) {}
+
+      let title = "";
+      let bodySnippet = "";
+      try {
+        const info = await this.driver.executeScript(
+          "return { title: document.title || '', body: (document.body && document.body.innerText) || '' };"
+        );
+        title = info && info.title ? info.title : "";
+        if (info && info.body) {
+          bodySnippet = info.body.substring(0, 500);
+        }
+      } catch (err) {}
+
+      logger.warn("Outstanding list failure page snapshot", {
+        url,
+        title,
+        bodySnippet,
+      });
+
+      const ts = new Date().toISOString().replace(/[:.]/g, "-");
+      const dir = path.join(__dirname, "..", "..", "screenshots");
+      try {
+        fs.mkdirSync(dir, { recursive: true });
+      } catch (err) {}
+      const filePath = path.join(dir, `outstanding_list_error_${ts}.png`);
+      const image = await this.driver.takeScreenshot();
+      fs.writeFileSync(filePath, image, "base64");
+      logger.warn("Saved screenshot for Outstanding list failure", {
+        filePath,
+      });
+    } catch (err) {}
+
     throw new Error("Outstanding Task list tidak bisa dibuka");
   }
 
@@ -837,6 +994,12 @@ class KoprolAutomation {
         request: rowData["Request"] || "",
         user: rowData["User Request"] || rowData["Requester"] || "",
         assignDate: rowData["Assign Date"] || rowData["Date"] || "",
+        // Ambil Due Date dari kolom list jika tersedia, supaya bisa diinformasikan ke WA.
+        dueDate:
+          rowData["Due Date"] ||
+          rowData["Due date"] ||
+          rowData["Due"] ||
+          "",
         state: rowData["State"] || "",
         clock: rowData["Clocking State"] || rowData["Clock"] || "",
         pic: (picValue || "").trim(),
@@ -853,6 +1016,159 @@ class KoprolAutomation {
     await this.login();
     await this.openOutstandingTaskList();
     return await this.scrapeOutstandingTasks(picName, maxRows);
+  }
+
+  // Baca informasi tanggal (Assign On, Due Date) langsung dari form tiket.
+  // Dipakai WhatsApp bot untuk memberi tahu user sebelum mengisi offset Days.
+  async getTicketDueDate(ticketIdentifier) {
+    if (!ticketIdentifier) {
+      throw new Error("Nomor tiket untuk membaca Due Date tidak diberikan");
+    }
+
+    await this.initialize();
+    await this.login();
+    await this.openOutstandingTaskList();
+
+    const row = await this.findOutstandingRow(ticketIdentifier);
+    if (!row) {
+      throw new Error(
+        `Tidak menemukan tiket ${ticketIdentifier} di Outstanding Task`
+      );
+    }
+
+    try {
+      await this.scrollIntoView(row);
+    } catch (e) {}
+
+    let rowOpened = false;
+    try {
+      await this.driver
+        .actions({ bridge: true })
+        .move({ origin: row })
+        .doubleClick()
+        .perform();
+      rowOpened = true;
+    } catch (e) {}
+
+    if (!rowOpened) {
+      try {
+        await row.click();
+        await this.driver.sleep(150);
+        await this.driver
+          .actions({ bridge: true })
+          .move({ origin: row })
+          .doubleClick()
+          .perform();
+        rowOpened = true;
+      } catch (e) {}
+    }
+
+    if (!rowOpened) {
+      try {
+        await row.click();
+        await this.driver.sleep(150);
+        await this.driver
+          .actions({ bridge: true })
+          .sendKeys(Key.RETURN)
+          .perform();
+        rowOpened = true;
+      } catch (e) {}
+    }
+
+    if (!rowOpened) {
+      throw new Error(
+        "Gagal membuka form tiket dari daftar Outstanding untuk membaca Due Date"
+      );
+    }
+
+    await this.waitForFormView();
+
+    // Pastikan bagian bawah form (yang berisi Due Date) terlihat
+    try {
+      await this.driver.executeScript(
+        "try { window.scrollTo(0, document.body.scrollHeight); } catch(e) {}"
+      );
+      await this.driver.sleep(300);
+    } catch (e) {}
+
+    const assignOn = await this.getFieldValueByLabel("Assign On");
+
+    // Pertama coba cara umum via getFieldValueByLabel
+    let dueDate = await this.getFieldValueByLabel("Due Date");
+
+    // Jika masih kosong, gunakan fallback yang lebih spesifik.
+    if (!dueDate) {
+      // 1) Langsung cari field span dengan name="due_date" seperti di screenshot DevTools.
+      try {
+        const dateSpans = await this.driver.findElements(
+          By.css("span.o_field_date.o_field_widget[name='due_date']")
+        );
+        if (dateSpans.length) {
+          let rawText = (await dateSpans[0].getText()).trim();
+          if (!rawText) {
+            try {
+              rawText = (
+                (await dateSpans[0].getAttribute("textContent")) || ""
+              ).trim();
+            } catch (e) {}
+          }
+          logger.info("Raw Due Date text from span[name=due_date]", {
+            ticketIdentifier,
+            rawText,
+          });
+          if (rawText) {
+            dueDate = rawText;
+          }
+        }
+      } catch (e) {
+        logger.warn(
+          "CSS lookup for span[name=due_date] failed",
+          e && e.message ? e.message : e
+        );
+      }
+
+      // 2) Jika masih belum ketemu, coba XPath berbasis label/td sebagai cadangan.
+      if (!dueDate) {
+        try {
+          const candidates = await this.driver.findElements(
+            By.xpath(
+              "//td[normalize-space(.)='Due Date']/following-sibling::td[1]//*[self::span or self::div or self::td]" +
+                " | //label[normalize-space(.)='Due Date']/ancestor::td/following-sibling::td[1]//*[self::span or self::div or self::td]"
+            )
+          );
+          if (candidates.length) {
+            let rawText = (await candidates[0].getText()).trim();
+            if (!rawText) {
+              try {
+                rawText = (
+                  (await candidates[0].getAttribute("textContent")) || ""
+                ).trim();
+              } catch (e) {}
+            }
+            logger.info("Raw Due Date text from label-based XPath", {
+              ticketIdentifier,
+              rawText,
+            });
+            if (rawText) {
+              dueDate = rawText;
+            }
+          }
+        } catch (e) {
+          logger.warn(
+            "Fallback XPath Due Date lookup failed",
+            e && e.message ? e.message : e
+          );
+        }
+      }
+    }
+
+    logger.info("Info tanggal tiket sebelum pengisian Done", {
+      ticketIdentifier,
+      assignOn,
+      dueDate,
+    });
+
+    return { assignOn, dueDate };
   }
 
   async findOutstandingRow(ticketIdentifier) {
@@ -1053,6 +1369,8 @@ class KoprolAutomation {
       urgency: closing.urgency || "",
       rca: (closing.rca || "").trim(),
       solution: (closing.solution || "").trim(),
+      // Nilai manual dari WhatsApp untuk offset Days (string), jika ada.
+      dueDays: typeof closing.dueDays === "string" ? closing.dueDays : null,
       dueDate: closing.dueDate || null,
       dueInDays: closing.dueInDays || 1,
     };
@@ -1139,13 +1457,32 @@ class KoprolAutomation {
     }
 
     if (closingData.impact) {
-      const impactFilled = await this.safeSelectDropdownInModal(
-        formRoot,
-        ["Impact"],
-        closingData.impact
-      );
+      let impactFilled = false;
+
+      // 1) Coba dropdown berdasarkan label yang umum dipakai
+      try {
+        impactFilled = await this.safeSelectDropdownInModal(
+          formRoot,
+          ["Impact", "Dampak"],
+          closingData.impact
+        );
+      } catch (e) {}
+
+      // 2) Fallback: field berbasis atribut teknis (mis. data-fieldname/name="impact")
       if (!impactFilled) {
-        throw new Error("Field Impact tidak ditemukan");
+        try {
+          impactFilled = await this.fillTextFieldByFieldNameAttr(
+            formRoot,
+            ["impact"],
+            closingData.impact
+          );
+        } catch (e) {}
+      }
+
+      if (!impactFilled) {
+        logger.warn(
+          "Field Impact tidak ditemukan, melewati pengisian impact",
+        );
       }
     }
 
@@ -1283,19 +1620,126 @@ class KoprolAutomation {
 
     await this.driver.sleep(500);
 
-    if (typeof this.setFutureDueDate === "function") {
+    // Baca Due Date sebelum diubah untuk menentukan apakah perlu diubah dan untuk verifikasi.
+    const beforeDueDateText = await this.getFieldValueByLabel("Due Date");
+
+    // Parse format seperti "21-12-2025 10:26:58" (DD-MM-YYYY HH:mm:ss) jika memungkinkan.
+    let beforeDueDateObj = null;
+    if (beforeDueDateText) {
       try {
-        await this.setFutureDueDate({
-          explicitDate: closingData.dueDate,
-          minOffsetDays: closingData.dueInDays || 1,
+        const m = beforeDueDateText.match(
+          /(\d{2})-(\d{2})-(\d{4})\s+(\d{2}):(\d{2}):(\d{2})/
+        );
+        if (m) {
+          const day = parseInt(m[1], 10);
+          const month = parseInt(m[2], 10) - 1;
+          const year = parseInt(m[3], 10);
+          const hh = parseInt(m[4], 10);
+          const mm = parseInt(m[5], 10);
+          const ss = parseInt(m[6], 10);
+          const d = new Date(year, month, day, hh, mm, ss);
+          if (!isNaN(d.getTime())) {
+            beforeDueDateObj = d;
+          }
+        }
+      } catch (e) {}
+    }
+
+    const now = new Date();
+    const nowTs = now.getTime();
+    const isAlreadyFuture =
+      beforeDueDateObj && beforeDueDateObj.getTime() > nowTs;
+
+    // Ambil preferensi manual dari WhatsApp (answers.dueDays) bila ada.
+    let manualOffsetDays = null;
+    let manualOffsetRaw = null;
+    if (closingData && typeof closingData.dueDays === "string") {
+      const raw = closingData.dueDays.trim();
+      if (raw) {
+        manualOffsetRaw = raw;
+        const normalized = raw.replace(",", ".");
+        const num = parseFloat(normalized);
+        if (!isNaN(num) && num > 0) {
+          manualOffsetDays = num;
+        }
+      }
+    }
+
+    logger.info("Due Date sebelum Set Due Date", {
+      raw: beforeDueDateText,
+      parsedIso: beforeDueDateObj ? beforeDueDateObj.toISOString() : null,
+      nowIso: now.toISOString(),
+      isAlreadyFuture,
+      manualOffsetRaw,
+    });
+
+    if (!isAlreadyFuture) {
+      // Hanya ubah Due Date jika saat ini belum di masa depan.
+      if (typeof this.setFutureDueDate === "function") {
+        // Jika user sudah memberikan offset Days manual via WhatsApp (dueDays > 0),
+        // gunakan nilai tersebut. Jika tidak, gunakan perhitungan otomatis H+1.
+        let offsetDaysSource = "auto";
+        let offsetDays = 2; // fallback aman jika parsing gagal
+        let overdueDays = 0;
+        const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+
+        if (manualOffsetDays !== null) {
+          offsetDays = manualOffsetDays;
+          offsetDaysSource = "manual";
+        } else if (beforeDueDateObj) {
+          const diffFromNowMs = nowTs - beforeDueDateObj.getTime();
+          overdueDays =
+            diffFromNowMs > 0
+              ? Math.ceil(diffFromNowMs / ONE_DAY_MS)
+              : 0;
+          offsetDays = Math.max(1, overdueDays + 1);
+        }
+
+        logger.info("Perhitungan offset Set Due Date", {
+          raw: beforeDueDateText,
+          parsedIso: beforeDueDateObj
+            ? beforeDueDateObj.toISOString()
+            : null,
+          nowIso: now.toISOString(),
+          overdueDays,
+          offsetDays,
+          offsetDaysSource,
+          manualOffsetRaw,
         });
-      } catch (e) {
-        logger.warn("setFutureDueDate gagal, melewati penyesuaian due date", {
-          message: e.message,
-        });
+
+        try {
+          await this.setFutureDueDate({
+            minOffsetDays: offsetDays,
+          });
+        } catch (e) {
+          throw new Error(
+            `Gagal membuka atau menyimpan dialog Set Due Date: ${
+              e.message || e
+            }`
+          );
+        }
+      } else {
+        throw new Error(
+          "Fitur Set Due Date belum diimplementasikan, tiket tidak akan di-Done"
+        );
+      }
+
+      // Beri waktu UI untuk meng-update field setelah wizard Set Due Date
+      await this.driver.sleep(700);
+      const afterDueDateText = await this.getFieldValueByLabel("Due Date");
+
+      if (!afterDueDateText || afterDueDateText === beforeDueDateText) {
+        throw new Error(
+          "Set Due Date tidak berhasil mengubah kolom Due Date. Mohon cek manual di Koprol."
+        );
       }
     } else {
-      logger.warn("setFutureDueDate belum diimplementasikan, melewati due date");
+      logger.info(
+        "Melewati perubahan Due Date karena sudah di masa depan",
+        {
+          beforeDueDateText,
+        }
+      );
     }
 
     const savedAfterDue = await this.clickSaveButton();
@@ -1309,12 +1753,49 @@ class KoprolAutomation {
     }
 
     await this.driver.sleep(1000);
-    return true;
+
+    // Setelah tiket berhasil di-Done di backend, siapkan data untuk halaman rating publik
+    let requestFormNumber = "";
+    try {
+      requestFormNumber =
+        (await this.getFieldValueByLabel("Request Form")) || "";
+    } catch (e) {}
+
+    let customerPhone = "";
+    try {
+      customerPhone =
+        (await this.getFieldValueByLabel("Nomor Telp")) || "";
+      if (!customerPhone) {
+        customerPhone =
+          (await this.getFieldValueByLabel("No. HP")) || "";
+      }
+    } catch (e) {}
+
+    // Bangun URL status_request publik untuk rating
+    const baseUrl =
+      (config.koprol && config.koprol.url) ||
+      "https://koprol.tunasgroup.com";
+    const publicBase = baseUrl
+      .replace(/\/web\/?$/, "")
+      .replace(/\/$/, "");
+
+    const statusUrl = requestFormNumber
+      ? `${publicBase}/status_request?search=${encodeURIComponent(
+          requestFormNumber
+        )}`
+      : "";
+
+    return {
+      success: true,
+      ticketIdentifier,
+      requestFormNumber,
+      statusUrl,
+      customerPhone,
+    };
   }
 
-  async setFutureDueDate() {
-    // Buka dialog Set Due Date dan langsung klik Save/Simpan.
-    // Logika perhitungan tanggal future dibiarkan ke Koprol (wizard default).
+  async setFutureDueDate({ minOffsetDays = 1 } = {}) {
+    // Buka dialog Set Due Date, isi offset Due Date > 0 (Days), pilih tipe Days, lalu klik Save.
     await this.dismissAnyModal(2000);
 
     const clicked = await this.clickSetDueDateButton();
@@ -1335,6 +1816,103 @@ class KoprolAutomation {
       throw new Error("Dialog Set Due Date tidak muncul");
     }
 
+    // Cari input offset (Due Date numeric) dan set minimal minOffsetDays
+    try {
+      const offsetInput = await modal.findElement(
+        By.css("input[name='due_date_input']")
+      );
+      await this.scrollIntoView(offsetInput).catch(() => {});
+      try {
+        await offsetInput.click();
+      } catch (e) {}
+      try {
+        await offsetInput.clear();
+      } catch (e) {}
+      await offsetInput.sendKeys(String(minOffsetDays));
+      await this.driver.sleep(200);
+    } catch (e) {
+      // Biarkan lanjut, tapi kemungkinan Due Date tidak akan berubah
+    }
+
+    // Pastikan unit offset adalah Days (bukan Hour/Minutes)
+    try {
+      let unitSelect = null;
+      // Coba seleksi langsung berdasarkan name
+      try {
+        unitSelect = await modal.findElement(
+          By.css("select[name='due_date_type']")
+        );
+      } catch (e1) {}
+
+      // Fallback: gunakan select pertama yang terlihat di dalam modal
+      if (!unitSelect) {
+        const allSelects = await modal.findElements(By.css("select"));
+        for (const sel of allSelects) {
+          try {
+            const display = (await sel.getCssValue("display")) || "";
+            const visibility = (await sel.getCssValue("visibility")) || "";
+            const opacity = parseFloat(
+              (await sel.getCssValue("opacity")) || "1"
+            );
+            const rect = await sel.getRect();
+            if (
+              display === "none" ||
+              visibility === "hidden" ||
+              opacity === 0 ||
+              rect.height < 2 ||
+              rect.width < 2
+            ) {
+              continue;
+            }
+            unitSelect = sel;
+            break;
+          } catch (e2) {}
+        }
+      }
+
+      if (!unitSelect) {
+        throw new Error(
+          "Field Due Date Type tidak ditemukan di dialog Set Due Date"
+        );
+      }
+
+      await this.scrollIntoView(unitSelect).catch(() => {});
+      try {
+        await unitSelect.click();
+        await this.driver.sleep(200);
+      } catch (e) {}
+
+      // Pilih option yang teksnya mengandung 'Day' atau 'Hari'
+      let picked = false;
+      const options = await unitSelect.findElements(By.css("option"));
+      for (const opt of options) {
+        let txt = "";
+        try {
+          txt = (await opt.getText()) || "";
+        } catch (e2) {}
+        const lower = txt.toLowerCase();
+        if (lower.includes("day") || lower.includes("hari")) {
+          try {
+            await opt.click();
+            picked = true;
+            break;
+          } catch (e3) {}
+        }
+      }
+
+      if (!picked) {
+        throw new Error(
+          "Opsi 'Days' untuk Due Date Type tidak ditemukan di dialog Set Due Date"
+        );
+      }
+
+      await this.driver.sleep(200);
+    } catch (e) {
+      // Jika gagal menemukan atau meng-set Due Date Type, lebih baik gagal eksplisit
+      throw e;
+    }
+
+    // Klik tombol Save / Simpan di dialog Set Due Date
     let saved = false;
     for (const label of ["Save", "Simpan"]) {
       if (saved) break;
@@ -1355,1324 +1933,672 @@ class KoprolAutomation {
     await this.driver.sleep(400);
   }
 
-  async ensureRequestFormListReady() {
-    const directUrl = `${config.koprol.url}/web#model=eps.request.form&view_type=list`;
-
-    // helper wait for renderer
-    const waitList = async (timeout = 15000) => {
-      try {
-        await this.driver.wait(
-          until.elementLocated(
-            By.css("table.o_list_table, .o_list_renderer, .o_list_view")
-          ),
-          timeout
-        );
-        return true;
-      } catch (e) {
-        return false;
-      }
-    };
-
-    // 1) Preferred: go directly to Request Form list via generic model URL (single quick attempt)
-    for (let attempt = 0; attempt < 1; attempt++) {
-      try {
-        logger.info(
-          `Opening Request Form list via direct URL (attempt ${
-            attempt + 1
-          }): ${directUrl}`
-        );
-        await this.driver.get(directUrl);
-        await this.waitForPageReady();
-        const listReady =
-          (await this.isRequestFormListVisible()) || (await waitList());
-        if (listReady) {
-          return true;
-        }
-      } catch (e) {
-        logger.warn("Direct URL Request Form load failed", {
-          url: directUrl,
-          message: e.message,
-        });
-      }
+  async openPublicTicketForm() {
+    if (!this.driver) {
+      await this.initialize();
     }
 
-    // 2) Fallback: use app switcher + JRF/ARF menu
-    try {
-      logger.warn(
-        "Direct URL path to Request Form failed, falling back to app switcher/menu navigation"
-      );
-      await this.openRequestFormApp();
-      await this.waitForUrlContains("model=eps.request.form", 12000);
-      await this.waitForPageReady();
-      if ((await this.isRequestFormListVisible()) || (await waitList(12000))) {
-        return true;
-      }
+    const baseUrl =
+      (config.koprol && config.koprol.url) ||
+      "https://koprol.tunasgroup.com";
+    const publicBase = baseUrl
+      .replace(/\/web\/?$/, "")
+      .replace(/\/$/, "");
+    const targetUrl = publicBase;
 
-      await this.selectJrfMenuOption("Request Form");
-      await this.waitForPageReady();
-      if ((await this.isRequestFormListVisible()) || (await waitList(12000))) {
-        return true;
-      }
-    } catch (e) {
-      logger.warn("Fallback navigation to Request Form list failed", {
-        message: e.message,
-      });
-    }
+    logger.info("Opening Koprol public request form", { url: targetUrl });
+    await this.driver.get(targetUrl);
 
-    // Instead of throwing, log warning and try to proceed anyway
-    // The page might be usable even if list detection failed
-    logger.warn(
-      "Could not confirm Request Form list view, attempting to proceed anyway"
-    );
-    return true;
-  }
-
-  async clearRequestFormFacets() {
-    try {
-      const cp = await this.driver.findElement(
-        By.xpath(
-          "//div[contains(@class,'o_control_panel')][.//ol[contains(@class,'breadcrumb')]//li[contains(normalize-space(.), 'Request Form')]]"
-        )
-      );
-      const removes = await cp.findElements(
-        By.css(".o_searchview .o_facet_remove")
-      );
-      for (const rm of removes) {
-        try {
-          await rm.click();
-          await this.driver.sleep(200);
-        } catch (e) {}
-      }
-      const rff = await cp.findElements(
-        By.xpath(
-          ".//div[contains(@class,'o_searchview_facet')][.//*[contains(normalize-space(.), 'Request Form Final')]]//i[contains(@class,'o_facet_remove')]"
-        )
-      );
-      for (const x of rff) {
-        try {
-          await x.click();
-          await this.driver.sleep(200);
-        } catch (e) {}
-      }
-    } catch (e) {
-      logger.warn("No search facets to clear");
-    }
-    await this.driver.sleep(300);
-  }
-
-  async applyNomorTicketFilter(ticketIdentifier) {
-    const searchInput = await this.getSearchInputForTitle("Request Form");
-    try {
-      await this.scrollIntoView(searchInput);
-    } catch (e) {}
-    let clickedSug = false;
-    for (let i = 0; i < 3 && !clickedSug; i++) {
-      await searchInput.click();
-      await this.driver.sleep(150);
-      await searchInput.clear().catch(() => {});
-      await searchInput.sendKeys(ticketIdentifier);
-      await this.driver.sleep(700);
-      clickedSug = await this.pickSearchSuggestion(
-        ["Search Nomor Ticket for", "Search Nomor Ticket Detail for"],
-        ticketIdentifier,
-        7000,
-        true
-      );
-    }
-    if (!clickedSug) {
-      throw new Error('Suggestion "Nomor Ticket" tidak muncul di list view');
-    }
-    await this.driver.sleep(1300);
-  }
-
-  async openTicketFormFromList(ticketIdentifier) {
-    await this.ensureRequestFormListReady();
-    await this.clearRequestFormFacets();
-    await this.applyNomorTicketFilter(ticketIdentifier);
-    await this.openListRowAndWaitForm(ticketIdentifier);
-  }
-
-  async getFieldValueByLabel(labelText) {
-    try {
-      const widget = await this.driver.findElement(
-        By.xpath(
-          `//label[contains(@class,'o_form_label')][contains(normalize-space(.), '${labelText}')]/following::div[contains(@class,'o_field_widget')][1]`
-        )
-      );
-      const text = await widget.getText();
-      return text.trim();
-    } catch (e) {
-      return "";
-    }
-  }
-
-  async getTicketDescriptionText() {
-    // 1) Prefer explicit field widgets by technical name (more reliable than label text)
-    const nameSelectors = [
-      "span.o_field_widget[name='keterangan']",
-      "span.o_field_widget[name='description']",
-      "div.o_field_widget[name='keterangan']",
-      "div.o_field_widget[name='description']",
-    ];
-    for (const sel of nameSelectors) {
-      try {
-        const el = await this.driver.findElement(By.css(sel));
-        const txt = ((await el.getText()) || "").trim();
-        if (txt) return txt;
-      } catch (e) {}
-    }
-
-    // 2) Fallback to label-based lookup
-    const labels = [
-      "Deskripsi",
-      "Description",
-      "Keterangan",
-      "Detail Request",
-      "Detail",
-      "Problem Description",
-    ];
-    for (const label of labels) {
-      try {
-        const val = await this.getFieldValueByLabel(label);
-        if (val) return val;
-      } catch (e) {}
-    }
-    return "";
-  }
-
-  async getLatestModal() {
-    const modals = await this.driver.findElements(By.css(".modal-content"));
-    if (!modals.length)
-      throw new Error("Modal not found after opening request line");
-    return modals[modals.length - 1];
-  }
-
-  async findVisibleInputs(scope, labelText = "") {
-    const candidates = await scope.findElements(By.css("textarea, input"));
-    for (const cand of candidates) {
-      try {
-        const ro = (await cand.getAttribute("readonly")) || "";
-        const dis = (await cand.getAttribute("disabled")) || "";
-        if (ro || dis) continue;
-        const display = (await cand.getCssValue("display")) || "";
-        const visibility = (await cand.getCssValue("visibility")) || "";
-        const opacity = parseFloat((await cand.getCssValue("opacity")) || "1");
-        const rect = await cand.getRect();
-        if (
-          display === "none" ||
-          visibility === "hidden" ||
-          opacity === 0 ||
-          rect.height < 2 ||
-          rect.width < 2
-        ) {
-          continue;
-        }
-        return cand;
-      } catch (e) {}
-    }
-    return null;
-  }
-
-  async clickButtonInModal(modal, containsText) {
-    let btn = null;
-    try {
-      btn = await modal.findElement(
-        By.xpath(`.//button[contains(normalize-space(.), '${containsText}')]`)
-      );
-    } catch (e) {}
-
-    if (!btn) {
-      const xp = `//div[contains(@class,'modal') or contains(@class,'o_dialog_container')]//button[contains(normalize-space(.), '${containsText}')]`;
-      const all = await this.driver.findElements(By.xpath(xp));
-      if (all.length) {
-        btn = all[all.length - 1];
-      }
-    }
-
-    if (!btn) {
-      throw new Error(`Button with text ${containsText} not found in modal`);
-    }
-
-    await btn.click();
-    await this.driver.sleep(400);
-  }
-
-  async fillTextFieldByLabel(modal, labelText, value) {
-    if (!value) return;
-
-    let widget = null;
-    // Primary: label + o_field_widget (standard Odoo form)
-    try {
-      widget = await modal.findElement(
-        By.xpath(
-          `.//label[contains(@class,'o_form_label')][contains(normalize-space(.), '${labelText}')]/following::div[contains(@class,'o_field_widget')][1]`
-        )
-      );
-    } catch (e) {}
-
-    // Fallback: table-based layout inside modal (td/th/span as label)
-    if (!widget) {
-      const labelCandidates = await modal.findElements(
-        By.xpath(
-          `.//*[self::label or self::td or self::th or self::span][contains(normalize-space(.), '${labelText}')]`
-        )
-      );
-      if (labelCandidates.length) {
-        const labelEl = labelCandidates[0];
-        const containerXPaths = [
-          "ancestor::tr[1]/td[position()>1]",
-          "parent::td/following-sibling::td[1]",
-          "following::td[1]",
-          'ancestor::div[contains(@class,"o_group") or contains(@class,"o_form_group")][1]',
-        ];
-        for (const xp of containerXPaths) {
-          const els = await labelEl.findElements(By.xpath(xp));
-          if (els.length) {
-            widget = els[0];
-            break;
-          }
-        }
-        if (!widget) {
-          widget = labelEl;
-        }
-      } else {
-        throw new Error(`Label not found for ${labelText}`);
-      }
-    }
-
-    const inputs = await widget.findElements(By.css("textarea, input"));
-    if (!inputs.length) {
-      throw new Error(`No text inputs found for label ${labelText}`);
-    }
-    let input = null;
-    for (const cand of inputs) {
-      try {
-        const ro = (await cand.getAttribute("readonly")) || "";
-        const dis = (await cand.getAttribute("disabled")) || "";
-        if (ro || dis) continue;
-        const display = (await cand.getCssValue("display")) || "";
-        const visibility = (await cand.getCssValue("visibility")) || "";
-        const opacity = parseFloat((await cand.getCssValue("opacity")) || "1");
-        const rect = await cand.getRect();
-        if (
-          display === "none" ||
-          visibility === "hidden" ||
-          opacity === 0 ||
-          rect.height < 2 ||
-          rect.width < 2
-        ) {
-          continue;
-        }
-        input = cand;
-        break;
-      } catch (e) {}
-    }
-    if (!input) {
-      // try visible elements globally with same name to avoid hidden duplicates
-      const fallback = await this.findVisibleInputs(modal, labelText);
-      if (fallback) input = fallback;
-    }
-    if (!input) input = inputs[0];
-    await this.scrollIntoView(input);
-    await input.click();
-    await this.driver.sleep(100);
-    await input.clear().catch(() => {});
-    await input.sendKeys(value);
-    await this.driver.sleep(200);
-  }
-
-  async fillTextFieldByName(modal, fieldName, value) {
-    if (!value) return false;
-    const selectors = [
-      `textarea[name="${fieldName}"]`,
-      `input[name="${fieldName}"]`,
-    ];
-    for (const sel of selectors) {
-      const inputs = await modal.findElements(By.css(sel));
-      if (!inputs.length) continue;
-      const input = inputs[0];
-      try {
-        const ro = (await input.getAttribute("readonly")) || "";
-        const dis = (await input.getAttribute("disabled")) || "";
-        if (ro || dis) continue;
-      } catch (e) {}
-
-      await this.scrollIntoView(input);
-      await input.click();
-      await this.driver.sleep(100);
-      await input.clear().catch(() => {});
-      await input.sendKeys(value);
-      await this.driver.sleep(200);
-      return true;
-    }
-    return false;
-  }
-
-  async fillTextFieldByFieldNameAttr(
-    scope,
-    fieldNames = [],
-    value,
-    bannedRowKeywords = []
-  ) {
-    if (!value || !fieldNames.length) return false;
-    const selectors = fieldNames.map(
-      (fn) =>
-        `[data-fieldname="${fn}"] textarea, [data-fieldname="${fn}"] input`
-    );
-    const elements = await scope.findElements(By.css(selectors.join(",")));
-    for (const el of elements) {
-      try {
-        const ro = (await el.getAttribute("readonly")) || "";
-        const dis = (await el.getAttribute("disabled")) || "";
-        if (ro || dis) continue;
-        const display = (await el.getCssValue("display")) || "";
-        const visibility = (await el.getCssValue("visibility")) || "";
-        const opacity = parseFloat((await el.getCssValue("opacity")) || "1");
-        const rect = await el.getRect();
-        if (
-          display === "none" ||
-          visibility === "hidden" ||
-          opacity === 0 ||
-          rect.height < 2 ||
-          rect.width < 2
-        ) {
-          continue;
-        }
-        if (bannedRowKeywords.length) {
-          const rows = await el.findElements(By.xpath("ancestor::tr[1]"));
-          if (rows.length) {
-            const rowText = ((await rows[0].getText()) || "").toLowerCase();
-            if (
-              bannedRowKeywords.some((k) => rowText.includes(k.toLowerCase()))
-            ) {
-              continue;
-            }
-          }
-        }
-      } catch (e) {}
-
-      await this.scrollIntoView(el);
-      await el.click();
-      await this.driver.sleep(100);
-      await el.clear().catch(() => {});
-      await el.sendKeys(value);
-      await this.driver.sleep(200);
-      return true;
-    }
-    return false;
-  }
-
-  async fillFieldInTableRow(modal, labelText, value) {
-    if (!value) return false;
-    let row;
-    try {
-      row = await modal.findElement(
-        By.xpath(
-          `.//tr[.//*[self::td or self::th or self::label or self::span][contains(normalize-space(.), '${labelText}')]]`
-        )
-      );
-    } catch (e) {
-      return false;
-    }
-
-    let fieldCell = null;
-    const cells = await row.findElements(
-      By.xpath("./td[position()>1] | ./th[position()>1]")
-    );
-    if (cells.length) {
-      fieldCell = cells[0];
-    } else {
-      fieldCell = row;
-    }
-
-    const inputs = await fieldCell.findElements(By.css("textarea, input"));
-    if (!inputs.length) return false;
-    const input = inputs[0];
-    await this.scrollIntoView(input);
-    await input.click();
-    await this.driver.sleep(100);
-    await input.clear().catch(() => {});
-    await input.sendKeys(value);
-    await this.driver.sleep(200);
-    return true;
-  }
-
-  async fillTextFieldByNameCandidates(
-    modal,
-    fieldNames = [],
-    value,
-    bannedRowKeywords = []
-  ) {
-    for (const name of fieldNames) {
-      const selectors = [`textarea[name="${name}"]`, `input[name="${name}"]`];
-      for (const sel of selectors) {
-        const inputs = await modal.findElements(By.css(sel));
-        if (!inputs.length) continue;
-        const input = inputs[0];
-        try {
-          const ro = (await input.getAttribute("readonly")) || "";
-          const dis = (await input.getAttribute("disabled")) || "";
-          if (ro || dis) continue;
-          if (bannedRowKeywords.length) {
-            const rows = await input.findElements(By.xpath("ancestor::tr[1]"));
-            if (rows.length) {
-              const rowText = ((await rows[0].getText()) || "").toLowerCase();
-              if (
-                bannedRowKeywords.some((k) => rowText.includes(k.toLowerCase()))
-              ) {
-                continue;
-              }
-            }
-          }
-        } catch (e) {}
-
-        await this.scrollIntoView(input);
-        await input.click();
-        await this.driver.sleep(100);
-        await input.clear().catch(() => {});
-        await input.sendKeys(value);
-        await this.driver.sleep(200);
-        return true;
-      }
-    }
-    return false;
-  }
-
-  async fillTextFieldByLooseLabel(modal, labelText, value) {
-    if (!value) return false;
-    const labelEls = await modal.findElements(
-      By.xpath(
-        `.//*[self::label or self::td or self::th or self::span][contains(normalize-space(.), '${labelText}')]`
-      )
-    );
-    if (!labelEls.length) return false;
-    const labelEl = labelEls[0];
-
-    const containerXPaths = [
-      "ancestor::tr[1]",
-      'ancestor::div[contains(@class,"o_group") or contains(@class,"o_form_group")][1]',
-      "parent::td/parent::tr",
-    ];
-    for (const xp of containerXPaths) {
-      const candidates = await labelEl.findElements(
-        By.xpath(`${xp}//textarea | ${xp}//input[@type="text" or not(@type)]`)
-      );
-      if (candidates.length) {
-        const input = candidates[0];
-        await this.scrollIntoView(input);
-        await input.click();
-        await this.driver.sleep(100);
-        await input.clear().catch(() => {});
-        await input.sendKeys(value);
-        await this.driver.sleep(200);
-        return true;
-      }
-    }
-
-    // Last resort: nearest following textarea/input (non-select)
-    const follow = await labelEl.findElements(
-      By.xpath(
-        `following::textarea[1] | following::input[@type="text" or not(@type)][1]`
-      )
-    );
-    if (follow.length) {
-      const input = follow[0];
-      await this.scrollIntoView(input);
-      await input.click();
-      await this.driver.sleep(100);
-      await input.clear().catch(() => {});
-      await input.sendKeys(value);
-      await this.driver.sleep(200);
-      return true;
-    }
-
-    return false;
-  }
-
-  async fillFirstEmptyTextarea(modal, value, bannedRowKeywords = []) {
-    if (!value) return false;
-    const areas = await modal.findElements(By.css("textarea"));
-    for (const ta of areas) {
-      try {
-        const ro = (await ta.getAttribute("readonly")) || "";
-        const dis = (await ta.getAttribute("disabled")) || "";
-        if (ro || dis) continue;
-        if (bannedRowKeywords.length) {
-          const rows = await ta.findElements(By.xpath("ancestor::tr[1]"));
-          if (rows.length) {
-            const rowText = ((await rows[0].getText()) || "").toLowerCase();
-            if (
-              bannedRowKeywords.some((k) => rowText.includes(k.toLowerCase()))
-            ) {
-              continue;
-            }
-          }
-        }
-      } catch (e) {}
-
-      let current = "";
-      try {
-        current = (await ta.getAttribute("value")) || "";
-      } catch (e) {}
-      if (!current) {
-        try {
-          current = await ta.getText();
-        } catch (e) {}
-      }
-      if (current && current.trim()) continue;
-
-      try {
-        await this.scrollIntoView(ta);
-        await ta.click();
-        await this.driver.sleep(100);
-        await ta.clear().catch(() => {});
-        await ta.sendKeys(value);
-        await this.driver.sleep(200);
-        return true;
-      } catch (e) {}
-    }
-    return false;
-  }
-
-  async fillFirstEmptyTextInput(modal, value) {
-    if (!value) return false;
-    const inputs = await modal.findElements(
-      By.css('input[type="text"], input:not([type])')
-    );
-    for (const input of inputs) {
-      try {
-        const typeAttr = (await input.getAttribute("type")) || "text";
-        if (typeAttr === "hidden") continue;
-        const ro = (await input.getAttribute("readonly")) || "";
-        const dis = (await input.getAttribute("disabled")) || "";
-        if (ro || dis) continue;
-        // Skip inputs that clearly belong to dropdown rows like Teams, PIC, Impact, Urgency, Request, etc.
-        const disqualifyLabels = [
-          "Teams",
-          "PIC",
-          "Impact",
-          "Urgency",
-          "Request",
-          "Tipe Request",
-          "Masalah",
-          "Category",
-        ];
-        const rows = await input.findElements(By.xpath("ancestor::tr[1]"));
-        if (rows.length) {
-          const rowText = (await rows[0].getText()) || "";
-          const lowerRow = rowText.toLowerCase();
-          if (
-            disqualifyLabels.some((l) => lowerRow.includes(l.toLowerCase()))
-          ) {
-            continue;
-          }
-        }
-      } catch (e) {}
-
-      let current = "";
-      try {
-        current = (await input.getAttribute("value")) || "";
-      } catch (e) {}
-      if (!current) {
-        try {
-          current = await input.getText();
-        } catch (e) {}
-      }
-      if (current && current.trim()) continue;
-
-      try {
-        await this.scrollIntoView(input);
-        await input.click();
-        await this.driver.sleep(100);
-        await input.clear().catch(() => {});
-        await input.sendKeys(value);
-        await this.driver.sleep(200);
-        return true;
-      } catch (e) {}
-    }
-    return false;
-  }
-
-  async selectDropdownByLabel(modal, labelText, value) {
-    if (!value) return;
-
-    let widget = null;
-    // Primary: label + o_field_widget
-    try {
-      widget = await modal.findElement(
-        By.xpath(
-          `.//label[contains(@class,'o_form_label')][contains(normalize-space(.), '${labelText}')]/following::div[contains(@class,'o_field_widget')][1]`
-        )
-      );
-    } catch (e) {}
-
-    if (!widget) {
-      const labelCandidates = await modal.findElements(
-        By.xpath(
-          `.//*[self::label or self::td or self::th or self::span][contains(normalize-space(.), '${labelText}')]`
-        )
-      );
-      if (labelCandidates.length) {
-        const labelEl = labelCandidates[0];
-        const containerXPaths = [
-          "ancestor::tr[1]/td[position()>1]",
-          "parent::td/following-sibling::td[1]",
-          "following::td[1]",
-          'ancestor::div[contains(@class,"o_group") or contains(@class,"o_form_group")][1]',
-        ];
-        for (const xp of containerXPaths) {
-          const els = await labelEl.findElements(By.xpath(xp));
-          if (els.length) {
-            widget = els[0];
-            break;
-          }
-        }
-        if (!widget) {
-          widget = labelEl;
-        }
-      } else {
-        throw new Error(`Label not found for ${labelText}`);
-      }
-    }
-
-    const selects = await widget.findElements(By.css("select"));
-    if (selects.length) {
-      const sel = selects[0];
-      await this.scrollIntoView(sel);
-      try {
-        await sel.click();
-      } catch (e) {}
-      await this.driver.sleep(100);
-
-      // Set option by visible text and fire change/input events so Odoo onchange (SLA/OLA) runs
-      await this.driver.executeScript(
-        "var sel=arguments[0], txt=(arguments[1]||'').toLowerCase();" +
-          "for (var i=0;i<sel.options.length;i++){var o=sel.options[i];" +
-          " if ((o.text||'').toLowerCase()===txt){sel.selectedIndex=i;break;}}" +
-          "sel.dispatchEvent(new Event('change',{bubbles:true}));" +
-          "sel.dispatchEvent(new Event('input',{bubbles:true}));",
-        sel,
-        value
-      );
-
-      await this.driver.sleep(250);
-      return;
-    }
-
-    const inputs = await widget.findElements(By.css("input"));
-    if (!inputs.length) {
-      throw new Error(`No dropdown inputs found for label ${labelText}`);
-    }
-    const input = inputs[0];
-    await input.click();
-    await this.driver.sleep(150);
-    await input.clear().catch(() => {});
-    await input.sendKeys(value);
-    await this.driver.sleep(400);
-
-    const lower = value.toLowerCase();
-    const optionXpath = `//ul[contains(@class,'ui-autocomplete') or contains(@class,'o-autocomplete') or contains(@class,'dropdown-menu')]//li[.//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'${lower}')] or contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'${lower}')]`;
-    const items = await this.driver.findElements(By.xpath(optionXpath));
-    if (items.length) {
-      await items[0].click();
-    } else {
-      await input.sendKeys(Key.RETURN);
-    }
-    await this.driver.sleep(300);
-  }
-
-  async selectDropdownInTableRow(modal, labelText, value) {
-    if (!value) return false;
-    let row;
-    try {
-      row = await modal.findElement(
-        By.xpath(
-          `.//tr[.//*[self::td or self::th or self::span][contains(normalize-space(.), '${labelText}')]]`
-        )
-      );
-    } catch (e) {
-      return false;
-    }
-
-    let fieldCell = null;
-    const cells = await row.findElements(
-      By.xpath("./td[position()>1] | ./th[position()>1]")
-    );
-    if (cells.length) {
-      fieldCell = cells[0];
-    } else {
-      fieldCell = row;
-    }
-
-    const selects = await fieldCell.findElements(By.css("select"));
-    if (selects.length) {
-      const sel = selects[0];
-      await this.scrollIntoView(sel);
-      try {
-        await sel.click();
-      } catch (e) {}
-      await this.driver.sleep(100);
-
-      await this.driver.executeScript(
-        "var sel=arguments[0], txt=(arguments[1]||'').toLowerCase();" +
-          "for (var i=0;i<sel.options.length;i++){var o=sel.options[i];" +
-          " if ((o.text||'').toLowerCase()===txt){sel.selectedIndex=i;break;}}" +
-          "sel.dispatchEvent(new Event('change',{bubbles:true}));" +
-          "sel.dispatchEvent(new Event('input',{bubbles:true}));",
-        sel,
-        value
-      );
-
-      await this.driver.sleep(250);
-      return true;
-    }
-
-    const inputs = await fieldCell.findElements(By.css("input"));
-    if (!inputs.length) return false;
-    const input = inputs[0];
-    await this.scrollIntoView(input);
-    await input.click();
-    await this.driver.sleep(150);
-    await input.clear().catch(() => {});
-    await input.sendKeys(value);
-    await this.driver.sleep(400);
-
-    const lower = value.toLowerCase();
-    const optionXpath = `//ul[contains(@class,'ui-autocomplete') or contains(@class,'o-autocomplete') or contains(@class,'dropdown-menu')]//li[.//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'${lower}')] or contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'${lower}')]`;
-    const items = await this.driver.findElements(By.xpath(optionXpath));
-    if (items.length) {
-      await items[0].click();
-    } else {
-      await input.sendKeys(Key.RETURN);
-    }
-    await this.driver.sleep(300);
-    return true;
-  }
-
-  async selectUrgencyDropdown(modal, value) {
-    if (!value) return false;
-    let row;
-    try {
-      row = await modal.findElement(
-        By.xpath(
-          ".//tr[.//label[contains(normalize-space(.), 'Urgency')] or .//td[contains(normalize-space(.), 'Urgency')]]"
-        )
-      );
-    } catch (e) {
-      return false;
-    }
-
-    // Autocomplete-style many2one: exactly mimic manual behaviour: type then Enter
-    let input = null;
-    const inputs = await row.findElements(
-      By.css("input.o_input.ui-autocomplete-input, .o_input_dropdown input.o_input")
-    );
-    if (inputs.length) {
-      input = inputs[0];
-    }
-    if (!input) return false;
-
-    await this.scrollIntoView(input);
-    try {
-      await input.click();
-    } catch (e) {}
-    await this.driver.sleep(150);
-
-    try {
-      await input.clear().catch(() => {});
-    } catch (e) {}
-    await input.sendKeys(value);
-    await this.driver.sleep(400);
-
-    // Press Enter to confirm selection and trigger onchange (SLA/OLA)
-    try {
-      await input.sendKeys(Key.RETURN);
-      await this.driver.sleep(400);
-      return true;
-    } catch (e) {
-      return false;
-    }
-  }
-
-  async safeFillTextFieldInModal(modal, labelCandidates, value) {
-    if (!value) return false;
-    // Try exact label mapping first
-    for (const label of labelCandidates) {
-      try {
-        await this.fillTextFieldByLabel(modal, label, value);
-        return true;
-      } catch (e) {
-        // continue
-      }
-    }
-    // Then try loose label (row-based) to avoid hitting wrong field like Teams
-    for (const label of labelCandidates) {
-      const ok = await this.fillTextFieldByLooseLabel(modal, label, value);
-      if (ok) return true;
-    }
-    return false;
-  }
-
-  async safeSelectDropdownInModal(modal, labelCandidates, value) {
-    if (!value) return false;
-    for (const label of labelCandidates) {
-      try {
-        await this.selectDropdownByLabel(modal, label, value);
-        return true;
-      } catch (e) {}
-    }
-    // Fallback: table-row based lookup (Assign dialog style)
-    for (const label of labelCandidates) {
-      try {
-        const ok = await this.selectDropdownInTableRow(modal, label, value);
-        if (ok) return true;
-      } catch (e) {}
-    }
-    return false;
-  }
-
-  async openRequestDetailFromMenu() {
-    // Try open dropdown JRF/ARF and choose Request Detail
-    let opened = false;
-    const menuTriggerXPaths = [
-      "//nav//*[self::a or self::button][contains(@class,'dropdown') or contains(@class,'o_menu_entry')][contains(normalize-space(.), 'JRF/ARF')]",
-      "//a[contains(@class,'dropdown-toggle')][contains(., 'JRF/ARF')]",
-      "//button[contains(., 'JRF/ARF')]",
-    ];
-    for (const xp of menuTriggerXPaths) {
-      const els = await this.driver.findElements(By.xpath(xp));
-      if (els.length) {
-        try {
-          await els[0].click();
-          await this.driver.sleep(200);
-          opened = true;
-          break;
-        } catch (e) {}
-      }
-    }
-    if (opened) {
-      const itemX =
-        "//a[normalize-space(.)='Request Detail' or contains(normalize-space(.), 'Request Detail')]";
-      const items = await this.driver.findElements(By.xpath(itemX));
-      if (items.length) {
-        try {
-          await items[0].click();
-        } catch (e) {}
-      }
-    }
-    if (!opened) {
-      // Fallback direct URL
-      await this.driver.get(
-        `${config.koprol.url}/web#model=eps.request.form.line&view_type=kanban&menu_id=301`
-      );
-    }
-    await this.waitForUrlContains("model=eps.request.form.line");
-    await this.waitForPageReady();
-    // Ensure kanban or list renderer is present
-    await this.driver.wait(
-      until.elementLocated(
-        By.css(".o_kanban_renderer, table.o_list_table, .o_list_renderer")
-      ),
-      12000
-    );
-  }
-
-  async getSearchInputForTitles(titles) {
-    for (const t of titles) {
-      try {
-        return await this.getSearchInputForTitle(t);
-      } catch (e) {}
-    }
-    throw new Error("Search input not found for titles: " + titles.join(", "));
-  }
-
-  async pickSearchSuggestion(
-    priorityTexts,
-    ticket,
-    timeout = 7000,
-    preferLast = true
-  ) {
-    const start = Date.now();
-    while (Date.now() - start < timeout) {
-      for (const label of priorityTexts) {
-        const xp = `//ul[contains(@class,'ui-autocomplete') or contains(@class,'o-autocomplete') or contains(@class,'dropdown-menu')]//li[.//*[contains(normalize-space(.), '${label}') and contains(normalize-space(.), '${ticket}')] or contains(normalize-space(.), '${label}') and contains(normalize-space(.), '${ticket}')]`;
-        const items = await this.driver.findElements(By.xpath(xp));
-        if (items.length) {
-          try {
-            const idx = preferLast ? items.length - 1 : 0;
-            await items[idx].click();
-            return true;
-          } catch (e) {}
-        }
-      }
-      // Generic catch-all: any suggestion that contains 'Nomor Ticket' and the ticket text
-      const generic = await this.driver.findElements(
-        By.xpath(
-          `//ul[contains(@class,'ui-autocomplete') or contains(@class,'o-autocomplete') or contains(@class,'dropdown-menu')]//li[.//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'nomor ticket') and contains(normalize-space(.), '${ticket}')] or contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'nomor ticket') and contains(normalize-space(.), '${ticket}')]`
-        )
-      );
-      if (generic.length) {
-        try {
-          await generic[preferLast ? generic.length - 1 : 0].click();
-          return true;
-        } catch (e) {}
-      }
-      await this.driver.sleep(200);
-    }
-    return false;
-  }
-
-  async waitForFormView(timeout = 12000) {
+    // Tunggu sampai field pencarian NIK (search_nik) muncul
     try {
       await this.driver.wait(
         until.elementLocated(
-          By.css(".o_form_view, .o_form_renderer, .o_form_sheet")
+          By.css("input[name='search_nik'], #search_nik")
         ),
-        timeout
-      );
-      await this.driver.sleep(200);
-      return true;
-    } catch (e) {
-      return false;
-    }
-  }
-
-  async openListRowAndWaitForm(ticketIdentifier = null) {
-    let row = null;
-    if (ticketIdentifier) {
-      const rowsByName = await this.driver.findElements(
-        By.xpath(
-          `//table[contains(@class,'o_list_table')]//tr[contains(@class,'o_data_row')][.//*[contains(normalize-space(.), '${ticketIdentifier}')]]`
-        )
-      );
-      if (rowsByName.length) row = rowsByName[0];
-    }
-    if (!row) {
-      row = await this.driver.findElement(
-        By.css("table.o_list_table tbody tr.o_data_row")
-      );
-    }
-    try {
-      await this.driver
-        .actions({ bridge: true })
-        .move({ origin: row })
-        .doubleClick()
-        .perform();
-    } catch (e) {
-      await row.click();
-      await this.driver.sleep(200);
-      await this.driver
-        .actions({ bridge: true })
-        .sendKeys(Key.RETURN)
-        .perform();
-    }
-    await this.waitForFormView();
-  }
-
-  async clickRfaButtonRobust() {
-    // Try several selectors and wait until visible
-    const xpathCandidates = [
-      "//div[contains(@class,'o_form_statusbar')]//button[@name='action_rfa']",
-      "//div[contains(@class,'o_form_statusbar')]//button[contains(translate(normalize-space(.),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'RFA')]",
-      "//button[@name='action_rfa']",
-      "//button[contains(translate(normalize-space(.),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'RFA')]",
-      "//header//button[@name='action_rfa']",
-      "//header//button//*[contains(translate(normalize-space(.),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'RFA')]/ancestor::button[1]",
-    ];
-    let btn = null;
-    for (const xp of xpathCandidates) {
-      const found = await this.driver.findElements(By.xpath(xp));
-      if (found.length) {
-        btn = found[0];
-        break;
-      }
-    }
-    if (!btn) {
-      // Ensure header is in view, then recheck
-      try {
-        await this.driver.executeScript("window.scrollTo(0,0);");
-      } catch (e) {}
-      await this.driver.sleep(200);
-      for (const xp of xpathCandidates) {
-        const found = await this.driver.findElements(By.xpath(xp));
-        if (found.length) {
-          btn = found[0];
-          break;
-        }
-      }
-    }
-    if (!btn) {
-      // Try action dropdown
-      const clicked = await this.clickActionMenuItem([
-        "RFA",
-        "Request For Approval",
-        "Request Approval",
-        "Ajukan Approval",
-        "Ajukan RFA",
-        "Minta Persetujuan",
-      ]);
-      if (clicked) {
-        await this.driver.sleep(1200);
-        return;
-      }
-      throw new Error("RFA button not found on form");
-    }
-    try {
-      try {
-        await this.scrollIntoView(btn);
-      } catch (e) {}
-      await this.driver.wait(until.elementIsVisible(btn), 3000).catch(() => {});
-      await btn.click();
-    } catch (e1) {
-      try {
-        await this.driver.executeScript("arguments[0].click();", btn);
-      } catch (e2) {
-        throw e1;
-      }
-    }
-    await this.driver.sleep(1200);
-  }
-
-  async clickActionMenuItem(labels) {
-    let toggles = await this.driver.findElements(
-      By.xpath(
-        "//div[contains(@class,'o_form_statusbar')]//*[self::button or self::a][contains(@class,'dropdown') or contains(@data-toggle,'dropdown') or contains(@aria-haspopup,'true')]"
-      )
-    );
-    // Also include explicit 'Action' button
-    const actionBtns = await this.driver.findElements(
-      By.xpath(
-        "//div[contains(@class,'o_form_statusbar')]//button[normalize-space(.)='Action' or contains(normalize-space(.), 'Action')]"
-      )
-    );
-    toggles = toggles.concat(actionBtns);
-    for (const t of toggles) {
-      try {
-        await t.click();
-        await this.driver.sleep(200);
-      } catch (e) {}
-      for (const l of labels) {
-        const items = await this.driver.findElements(
-          By.xpath(
-            `//div[contains(@class,'dropdown-menu') and contains(@class,'show')]//a[normalize-space(.)='${l}' or contains(normalize-space(.), '${l}')]`
-          )
-        );
-        if (items.length) {
-          try {
-            await items[0].click();
-            return true;
-          } catch (e) {}
-        }
-      }
-    }
-    return false;
-  }
-
-  async scrollIntoView(el) {
-    try {
-      await this.driver.executeScript(
-        'arguments[0].scrollIntoView({block:"center", inline:"center"});',
-        el
+        15000
       );
     } catch (e) {}
-    await this.driver.sleep(150);
   }
 
-  async tryDragTicketToApproved(ticketIdentifier) {
-    const draftGroup = await this.getKanbanGroup("Draft");
-    const approvedGroup = await this.getKanbanGroup("Approved");
-    if (!draftGroup || !approvedGroup) return false;
-    const card = await this.driver.findElement(
-      By.xpath(
-        `//div[contains(@class,'o_kanban_group')][.//div[contains(@class,'o_kanban_header')]//*[contains(normalize-space(.), 'Draft')]]//div[contains(@class,'o_kanban_record')][.//*[contains(normalize-space(.), '${ticketIdentifier}')]]`
-      )
-    );
-    const toCol = approvedGroup.drop || approvedGroup.group;
+  async findPublicNikInput() {
+    if (!this.driver) {
+      await this.initialize();
+    }
 
-    await this.scrollIntoView(card);
-    await this.scrollIntoView(toCol);
-
-    // Attempt 1: press-move-release to target column
+    // Field pencarian NIK memiliki name/id 'search_nik' sesuai inspeksi di browser
     try {
-      await this.driver
-        .actions({ bridge: true })
-        .move({ origin: card })
-        .press()
-        .pause(200)
-        .move({ origin: toCol, x: 30, y: 30 })
-        .pause(300)
-        .release()
-        .perform();
+      const el = await this.driver.findElement(
+        By.css("input[name='search_nik'], #search_nik")
+      );
+      if (el) {
+        return el;
+      }
     } catch (e) {}
-    await this.driver.sleep(800);
-    let moved = await this.waitForCardInColumn(
-      "Approved",
-      ticketIdentifier,
-      1500
-    );
 
-    // Attempt 2: dragAndDrop fallback
-    if (!moved) {
-      try {
-        await this.driver
-          .actions({ bridge: true })
-          .dragAndDrop(card, toCol)
-          .perform();
-      } catch (e) {}
-      await this.driver.sleep(800);
-      moved = await this.waitForCardInColumn(
-        "Approved",
-        ticketIdentifier,
-        1500
-      );
-    }
-
-    // Attempt 3: HTML5 drag & drop via JS events
-    if (!moved) {
-      try {
-        const script = `
-                  function h5DragDrop(src, tgt){
-                    const dt = new DataTransfer();
-                    const ev = (type, el)=>{
-                      const e = new DragEvent(type, {bubbles:true, cancelable:true, dataTransfer: dt});
-                      el.dispatchEvent(e);
-                    };
-                    ev('dragstart', src);
-                    ev('dragenter', tgt);
-                    ev('dragover', tgt);
-                    ev('drop', tgt);
-                    ev('dragend', src);
-                  }
-                  h5DragDrop(arguments[0], arguments[1]);
-                `;
-        await this.driver.executeScript(script, card, toCol);
-      } catch (e) {}
-      await this.driver.sleep(900);
-      moved = await this.waitForCardInColumn(
-        "Approved",
-        ticketIdentifier,
-        1500
-      );
-    }
-
-    return moved;
-  }
-
-  async getKanbanGroup(title) {
-    const group = await this.driver.findElements(
-      By.xpath(
-        `//div[contains(@class,'o_kanban_group')][.//div[contains(@class,'o_kanban_header')]//*[contains(normalize-space(.), '${title}')]]`
-      )
-    );
-    if (!group.length) return null;
-    let drop = null;
-    try {
-      drop = await group[0].findElement(By.css("div.o_kanban_records"));
-    } catch (e) {}
-    return { group: group[0], drop };
-  }
-
-  async waitForCardInColumn(columnTitle, ticketIdentifier, timeout = 3000) {
-    const start = Date.now();
-    while (Date.now() - start < timeout) {
-      const found = await this.driver.findElements(
-        By.xpath(
-          `//div[contains(@class,'o_kanban_group')][.//div[contains(@class,'o_kanban_header')]//*[contains(normalize-space(.), '${columnTitle}')]]//div[contains(@class,'o_kanban_record')][.//*[contains(normalize-space(.), '${ticketIdentifier}')]]`
-        )
-      );
-      if (found.length) return true;
-      await this.driver.sleep(200);
-    }
-    return false;
-  }
-
-  async clickStatusbarStage(target = "Approved", waitMs = 5000) {
-    // Try buttons/links within form statusbar which have stage labels
-    const candidates = [
-      target,
-      "Approve",
-      "Approved",
-      "Approval",
-      "Setujui",
-      "Setuju",
+    // Fallback: coba beberapa selector generik sambil scroll ke bawah
+    const selectors = [
+      "input[name*='nik']",
+      "input[id*='nik']",
+      "input[placeholder*='NIK']",
+      "input[placeholder*='Nik']",
+      "input[placeholder*='nik']",
     ];
-    let els = [];
-    for (const lab of candidates) {
-      els = await this.driver.findElements(
-        By.xpath(
-          `//div[contains(@class,'o_form_statusbar')]//*[self::button or self::a or self::span][contains(normalize-space(.), '${lab}')]`
-        )
-      );
-      if (els.length) break;
-    }
-    if (!els.length) return false;
-    // Click the closest clickable element (button/a)
-    let clickable = els[0];
-    try {
-      clickable = await els[0].findElement(By.xpath("ancestor::button[1]"));
-    } catch (e) {
-      try {
-        clickable = await els[0].findElement(By.xpath("ancestor::a[1]"));
-      } catch (e2) {}
-    }
-    try {
-      await clickable.click();
-    } catch (e) {
-      return false;
-    }
-    const start = Date.now();
-    while (Date.now() - start < waitMs) {
-      const active = await this.driver.findElements(
-        By.xpath(
-          `//div[contains(@class,'o_form_statusbar')]//*[contains(normalize-space(.), '${target}')][contains(@class,'active') or contains(@class,'btn-primary') or @aria-pressed='true' or @aria-checked='true']`
-        )
-      );
-      if (active.length) return true;
-      await this.driver.sleep(200);
-    }
-    // Some views don't mark active; assume success if no error
-    return true;
-  }
 
-  async openRequestFormApp() {
-    // Open app switcher (grid button at top-left)
-    const toggleSelectors = [
-      "button.o_menu_toggle",
-      "a.o_menu_toggle",
-      ".o_navbar_apps",
-      ".o_menu_apps",
-    ];
-    for (const sel of toggleSelectors) {
-      const found = await this.driver.findElements(By.css(sel));
-      if (found.length) {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      for (const sel of selectors) {
         try {
-          await found[0].click();
-          await this.driver.sleep(400);
+          const el = await this.driver.findElement(By.css(sel));
+          if (el) {
+            return el;
+          }
+        } catch (e) {}
+      }
+
+      try {
+        await this.driver.executeScript(
+          "window.scrollBy(0, Math.max(400, window.innerHeight/2));"
+        );
+      } catch (e) {}
+      await this.driver.sleep(400);
+    }
+
+    throw new Error("Field NIK pada form publik tidak ditemukan");
+  }
+
+  async findPublicLabelElement(labelCandidates = []) {
+    if (!this.driver) {
+      await this.initialize();
+    }
+
+    const labels = Array.isArray(labelCandidates)
+      ? labelCandidates
+      : [labelCandidates];
+
+    for (const labelText of labels) {
+      if (!labelText) continue;
+      const lower = String(labelText).toLowerCase();
+      const xp =
+        "//*[self::label or self::td or self::th or self::div]" +
+        "[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')," +
+        this.xpathLiteral(lower) +
+        ")]";
+      try {
+        const el = await this.driver.findElement(By.xpath(xp));
+        if (el) {
+          return el;
+        }
+      } catch (e) {}
+    }
+
+    return null;
+  }
+
+  async readPublicTextFieldByLabel(labelCandidates = []) {
+    const labelEl = await this.findPublicLabelElement(labelCandidates);
+    if (!labelEl) {
+      return "";
+    }
+
+    // Coba cari input yang benar-benar terlihat (bukan hidden / ID internal)
+    try {
+      const candidates = await labelEl.findElements(
+        By.xpath(".//following::input[position() <= 3]")
+      );
+      let chosen = null;
+      for (const input of candidates) {
+        try {
+          const typeAttr =
+            ((await input.getAttribute("type")) || "text").toLowerCase();
+          if (typeAttr === "hidden") continue;
+          // Hanya pilih input yang benar-benar terlihat di layar (boleh readonly)
+          try {
+            const visible = await input.isDisplayed();
+            if (!visible) continue;
+          } catch (e) {
+            continue;
+          }
+          chosen = input;
           break;
         } catch (e) {}
       }
-    }
 
-    // Wait app tiles
-    try {
-      await this.driver.wait(
-        until.elementLocated(By.css("a.o_app, .o_app")),
-        8000
-      );
+      if (chosen) {
+        const val = ((await chosen.getAttribute("value")) || "").trim();
+        if (val) {
+          return val;
+        }
+        const txt = ((await chosen.getText()) || "").trim();
+        if (txt) {
+          return txt;
+        }
+      }
     } catch (e) {}
 
-    // Click Request Form tile by text
-    let clicked = false;
-    const tileXPaths = [
-      "//a[contains(@class,'o_app')][.//span[contains(., 'Request Form')] or contains(., 'Request Form')]",
-      "//div[contains(@class,'o_app')][.//span[contains(., 'Request Form')] or contains(., 'Request Form')]",
-      "//a[.//div[contains(., 'Request Form')] or .//span[contains(., 'Request Form')]]",
+    // Fallback: input pertama setelah label (bisa saja ID internal)
+    try {
+      const input = await labelEl.findElement(By.xpath(".//following::input[1]"));
+      const val = ((await input.getAttribute("value")) || "").trim();
+      if (val) {
+        return val;
+      }
+    } catch (e) {}
+
+    // Fallback terakhir: teks di sekitar label
+    try {
+      const txt = ((await labelEl.getText()) || "").trim();
+      if (txt) {
+        return txt;
+      }
+    } catch (e) {}
+
+    return "";
+  }
+
+  async readPublicDropdownOptionsByLabel(labelCandidates = []) {
+    const labelEl = await this.findPublicLabelElement(labelCandidates);
+    if (!labelEl) {
+      return [];
+    }
+
+    const texts = [];
+
+    // 1) Coba baca langsung dari elemen <select> (jika ada)
+    let select = null;
+    try {
+      select = await labelEl.findElement(By.xpath(".//following::select[1]"));
+    } catch (e) {}
+
+    if (select) {
+      try {
+        const options = await select.findElements(By.css("option"));
+        for (const opt of options) {
+          try {
+            const txt = ((await opt.getText()) || "").trim();
+            if (txt) {
+              texts.push(txt);
+            }
+          } catch (e) {}
+        }
+      } catch (e) {}
+    }
+
+    // 2) Jika belum ada hasil, coba baca dari komponen Select2 (dropdown modern)
+    if (!texts.length) {
+      try {
+        let container = null;
+        try {
+          container = await labelEl.findElement(
+            By.xpath(
+              "./ancestor::div[contains(@class,'s_website_form_field') or contains(@class,'form-group')][1]"
+            )
+          );
+        } catch (e) {
+          container = labelEl;
+        }
+
+        let trigger = null;
+        try {
+          trigger = await container.findElement(
+            By.css("span.select2-selection, span.select2-selection__rendered")
+          );
+        } catch (e) {}
+
+        if (trigger) {
+          try {
+            await this.scrollIntoView(trigger).catch(() => {});
+          } catch (e) {}
+          try {
+            await trigger.click();
+            await this.driver.sleep(300);
+          } catch (e) {}
+
+          try {
+            const items = await this.driver.findElements(
+              By.css(".select2-results__option")
+            );
+            for (const li of items) {
+              try {
+                const txt = ((await li.getText()) || "").trim();
+                if (!txt) continue;
+                if (/silahkan pilih/i.test(txt)) continue;
+                texts.push(txt);
+              } catch (e) {}
+            }
+          } catch (e) {}
+        }
+      } catch (e) {}
+    }
+
+    const seen = new Set();
+    const unique = [];
+    for (const t of texts) {
+      const key = t.toLowerCase();
+      if (!seen.has(key)) {
+        seen.add(key);
+        unique.push(t);
+      }
+    }
+    return unique;
+  }
+
+  async readRequestKeOptions() {
+    if (!this.driver) {
+      await this.initialize();
+    }
+
+    const texts = [];
+
+    // 1) Coba langsung via JS di document (lebih tahan terhadap Select2/hidden select)
+    try {
+      const jsTexts =
+        (await this.driver.executeScript(function () {
+          const sel =
+            document.querySelector(
+              "select[name='department_request_id'], #department_request_id"
+            ) || null;
+          if (!sel || !sel.options) return [];
+          const out = [];
+          for (let i = 0; i < sel.options.length; i++) {
+            const opt = sel.options[i];
+            const txt = (opt.textContent || "").trim();
+            if (!txt) continue;
+            if (/silahkan pilih/i.test(txt)) continue;
+            out.push(txt);
+          }
+          return out;
+        })) || [];
+      if (Array.isArray(jsTexts)) {
+        for (const t of jsTexts) {
+          texts.push(String(t));
+        }
+      }
+    } catch (e) {}
+
+    // 2) Fallback: pakai WebDriver langsung pada elemen <select>
+    if (!texts.length) {
+      try {
+        const select = await this.driver.findElement(
+          By.css("select[name='department_request_id'], #department_request_id")
+        );
+        const options = await select.findElements(By.css("option"));
+        for (const opt of options) {
+          try {
+            const txt = ((await opt.getText()) || "").trim();
+            if (!txt) continue;
+            if (/silahkan pilih/i.test(txt)) continue;
+            texts.push(txt);
+          } catch (e) {}
+        }
+      } catch (e) {}
+    }
+
+    // 2) Fallback: gunakan mekanisme umum berbasis label
+    if (!texts.length) {
+      try {
+        const viaLabel = await this.readPublicDropdownOptionsByLabel([
+          "Request ke",
+          "Request Ke",
+        ]);
+        for (const t of viaLabel) {
+          texts.push(t);
+        }
+      } catch (e) {}
+    }
+
+    const seen = new Set();
+    const unique = [];
+    for (const t of texts) {
+      const key = t.toLowerCase();
+      if (!seen.has(key)) {
+        seen.add(key);
+        unique.push(t);
+      }
+    }
+    return unique;
+  }
+
+  async applyPublicDropdownSelection(labelCandidates = [], value) {
+    if (!value) {
+      return false;
+    }
+
+    const labelEl = await this.findPublicLabelElement(labelCandidates);
+    if (!labelEl) {
+      return false;
+    }
+
+    let select = null;
+    try {
+      select = await labelEl.findElement(By.xpath(".//following::select[1]"));
+    } catch (e) {}
+
+    if (!select) {
+      return false;
+    }
+
+    const targetLower = String(value).toLowerCase();
+    try {
+      const options = await select.findElements(By.css("option"));
+      for (const opt of options) {
+        let txt = "";
+        try {
+          txt = ((await opt.getText()) || "").trim();
+        } catch (e) {}
+        if (!txt) continue;
+        if (txt.toLowerCase() === targetLower) {
+          await this.scrollIntoView(select).catch(() => {});
+          try {
+            await select.click();
+          } catch (e) {}
+          try {
+            await opt.click();
+          } catch (e) {}
+          await this.driver.sleep(200);
+          return true;
+        }
+      }
+    } catch (e) {}
+
+    return false;
+  }
+
+  async inspectPublicRequestForm(nikRaw) {
+    const nik = (nikRaw || "").trim();
+    if (!nik) {
+      throw new Error("NIK wajib diisi");
+    }
+
+    await this.openPublicTicketForm();
+
+    const nikInput = await this.findPublicNikInput();
+    await this.scrollIntoView(nikInput).catch(() => {});
+    try {
+      await nikInput.clear();
+    } catch (e) {}
+    await nikInput.sendKeys(nik);
+    await this.driver.sleep(300);
+    try {
+      await nikInput.sendKeys(Key.ENTER);
+    } catch (e) {}
+
+    // Tunggu sampai form benar-benar mengisi nama/email setelah NIK di-enter
+    let nama = "";
+    let email = "";
+    const startTs = Date.now();
+    const timeoutMs = 7000;
+    while (Date.now() - startTs < timeoutMs) {
+      try {
+        const namaInput = await this.driver.findElement(
+          By.css("input[name='name_pegawai']")
+        );
+        if (await namaInput.isDisplayed()) {
+          nama = ((await namaInput.getAttribute("value")) || "").trim();
+        }
+      } catch (e) {}
+
+      try {
+        const emailInput = await this.driver.findElement(
+          By.css("input[name='email'], input[name*='email']")
+        );
+        if (await emailInput.isDisplayed()) {
+          email = ((await emailInput.getAttribute("value")) || "").trim();
+        }
+      } catch (e) {}
+
+      if (nama || email) {
+        break;
+      }
+      await this.driver.sleep(400);
+    }
+
+    const dropdowns = {
+      requestKe: (await this.readRequestKeOptions()) || [],
+      tipeRequestFor:
+        (await this.readPublicDropdownOptionsByLabel([
+          "Tipe Request For",
+          "Type Request For",
+        ])) || [],
+      system:
+        (await this.readPublicDropdownOptionsByLabel([
+          "System",
+          "Sistem",
+        ])) || [],
+      tipeMasalah:
+        (await this.readPublicDropdownOptionsByLabel([
+          "Tipe Masalah",
+          "Problem Type",
+        ])) || [],
+    };
+
+    if (!nama && !email) {
+      return {
+        ok: false,
+        nik,
+        errorMessage:
+          "NIK belum terdaftar di sistem atau form publik tidak mengembalikan data nama/email.",
+      };
+    }
+
+    return {
+      ok: true,
+      nik,
+      nama,
+      email,
+      dropdowns,
+    };
+  }
+
+  async submitPublicRequestForm(payload = {}) {
+    const data = payload || {};
+    const nik = (data.nik || "").trim();
+    if (!nik) {
+      throw new Error("NIK wajib diisi untuk submit form publik");
+    }
+
+    await this.openPublicTicketForm();
+
+    const nikInput = await this.findPublicNikInput();
+    await this.scrollIntoView(nikInput).catch(() => {});
+    try {
+      await nikInput.clear();
+    } catch (e) {}
+    await nikInput.sendKeys(nik);
+    await this.driver.sleep(300);
+    try {
+      await nikInput.sendKeys(Key.ENTER);
+    } catch (e) {}
+    await this.driver.sleep(1200);
+
+    if (data.noHp) {
+      await this.fillPublicPhoneField(data.noHp).catch(() => {});
+    }
+
+    if (data.requestKe) {
+      await this.selectRequestKeOnForm(data.requestKe).catch(() => {});
+    }
+
+    if (data.tipeRequestFor) {
+      await this.applyPublicDropdownSelection(
+        ["Tipe Request For", "Type Request For"],
+        data.tipeRequestFor
+      );
+    }
+
+    if (data.system) {
+      await this.applyPublicDropdownSelection(
+        ["System", "Sistem"],
+        data.system
+      );
+    }
+
+    if (data.tipeMasalah) {
+      await this.applyPublicDropdownSelection(
+        ["Tipe Masalah", "Problem Type"],
+        data.tipeMasalah
+      );
+    }
+
+    if (data.keterangan) {
+      try {
+        const descLabel = await this.findPublicLabelElement([
+          "Keterangan",
+          "Deskripsi",
+          "Description",
+        ]);
+        if (descLabel) {
+          try {
+            const ta = await descLabel.findElement(
+              By.xpath(".//following::textarea[1]")
+            );
+            await this.scrollIntoView(ta).catch(() => {});
+            try {
+              await ta.click();
+            } catch (e) {}
+            try {
+              await ta.clear();
+            } catch (e) {}
+            await ta.sendKeys(String(data.keterangan));
+          } catch (e) {}
+        }
+      } catch (e) {}
+    }
+
+    let submitClicked = false;
+    const submitLabels = [
+      "Submit",
+      "Kirim",
+      "Ajukan",
     ];
-    for (const xp of tileXPaths) {
+    for (const label of submitLabels) {
+      const upper = (label || "").toUpperCase();
+      const xp =
+        `//button[normalize-space(.)='${label}']` +
+        ` | //button[contains(translate(normalize-space(.),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'${upper}')]` +
+        ` | //a[normalize-space(.)='${label}']` +
+        ` | //a[contains(translate(normalize-space(.),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'${upper}')]`;
+      try {
+        const btn = await this.driver.findElement(By.xpath(xp));
+        await this.scrollIntoView(btn).catch(() => {});
+        try {
+          await btn.click();
+        } catch (e) {}
+        submitClicked = true;
+        break;
+      } catch (e) {}
+    }
+
+    if (!submitClicked) {
+      throw new Error("Tombol submit pada form publik tidak ditemukan");
+    }
+
+    await this.driver.sleep(1500);
+
+    let successMessage = "";
+    try {
+      const alertEl = await this.driver.findElement(
+        By.css(".alert-success, .oe_website_messages, .alert")
+      );
+      successMessage = ((await alertEl.getText()) || "").trim();
+    } catch (e) {}
+
+    return {
+      ok: true,
+      nik,
+      successMessage,
+    };
+  }
+
+  async submitTicketRating(options = {}) {
+    const { statusUrl, rating = 5, comment = "", action = "done" } =
+      options || {};
+
+    if (!statusUrl) {
+      throw new Error("statusUrl wajib diisi untuk submit rating tiket");
+    }
+
+    if (!this.driver) {
+      await this.initialize();
+    }
+
+    const safeRating = Math.max(
+      1,
+      Math.min(5, parseInt(rating, 10) || 5)
+    );
+
+    logger.info("Opening ticket status page for rating", {
+      url: statusUrl,
+      rating: safeRating,
+      action,
+    });
+
+    await this.driver.get(statusUrl);
+    await this.driver.sleep(1000);
+
+    // Set bintang rating 1	7 di halaman status_request publik
+    try {
+      await this.driver.executeScript(
+        "var n=arguments[0]||5;" +
+          "var containers=Array.from(document.querySelectorAll('*')).filter(function(el){return /Rating Pelayanan/i.test(el.textContent||'');});" +
+          "var root=containers.length?containers[0].parentElement:document;" +
+          "var stars=root.querySelectorAll('.fa-star, .fa-star-o, .fa-star-half, .rating i, .rating-star, .star-rating i');" +
+          "if(!stars.length){stars=document.querySelectorAll('.fa-star, .rating i, .rating-star, .star-rating i');}" +
+          "for(var i=0;i<stars.length;i++){ if(i<n){stars[i].dispatchEvent(new MouseEvent('click',{bubbles:true})); } }" +
+          "return stars.length;",
+        safeRating
+      );
+    } catch (e) {
+      logger.warn(
+        "Failed to set rating stars on status page",
+        e.message || e
+      );
+    }
+
+    // Isi komentar jika ada
+    if (comment) {
+      try {
+        const textareas = await this.driver.findElements(
+          By.css(
+            "textarea[placeholder*='Comment'], textarea[placeholder*='comment'], textarea"
+          )
+        );
+        for (const ta of textareas) {
+          try {
+            const rect = await ta.getRect();
+            if (rect.width < 2 || rect.height < 2) continue;
+            await this.scrollIntoView(ta).catch(() => {});
+            await ta.click().catch(() => {});
+            await this.driver.sleep(100);
+            try {
+              await ta.clear();
+            } catch (e) {}
+            await ta.sendKeys(comment);
+            await this.driver.sleep(150);
+            break;
+          } catch (e) {}
+        }
+      } catch (e) {
+        logger.warn("Failed to fill rating comment", e.message || e);
+      }
+    }
+
+    // Tekan tombol Done Ticket atau Return Ticket
+    const labels =
+      action === "return" ? ["Return Ticket", "Return"] : ["Done Ticket", "Done"];
+    let clicked = false;
+
+    for (const label of labels) {
+      const upper = (label || "").toUpperCase();
+      const xp =
+        `//button[normalize-space(.)='${label}']` +
+        ` | //button[contains(translate(normalize-space(.),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'${upper}')]` +
+        ` | //a[normalize-space(.)='${label}']` +
+        ` | //a[contains(translate(normalize-space(.),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'${upper}')]`;
       const els = await this.driver.findElements(By.xpath(xp));
       if (els.length) {
         try {
-          await els[0].click();
+          const btn = els[0];
+          await this.scrollIntoView(btn).catch(() => {});
+          await btn.click();
           clicked = true;
           break;
         } catch (e) {}
@@ -2680,482 +2606,20 @@ class KoprolAutomation {
     }
 
     if (!clicked) {
-      // Fallback: go directly by generic model URL (without menu/action to avoid wrong apps)
-      await this.driver.get(
-        `${config.koprol.url}/web#model=eps.request.form&view_type=list`
-      );
+      logger.warn("Rating action button not found on status page", {
+        action,
+      });
     }
 
-    await this.waitForPageReady();
+    await this.driver.sleep(1000);
 
-    // Ensure list/kanban content really loaded (not Discuss)
-    try {
-      await this.driver.wait(
-        until.elementLocated(
-          By.css(
-            ".o_list_view, .o_list_renderer, table.o_list_table, .o_kanban_renderer"
-          )
-        ),
-        20000
-      );
-    } catch (e) {
-      logger.warn(
-        "Timeout waiting for list/kanban renderer after openRequestFormApp, continuing anyway"
-      );
-    }
-  }
-
-  async openFirstRequestLineModalFromForm() {
-    // Ensure Request tab is active
-    try {
-      const tab = await this.driver.findElement(
-        By.xpath(
-          "//div[contains(@class,'o_notebook')]//a[contains(@class,'nav-link')][.//span[normalize-space(.)='Request'] or normalize-space(.)='Request']"
-        )
-      );
-      try {
-        await tab.click();
-        await this.driver.sleep(400);
-      } catch (e) {}
-    } catch (e) {}
-
-    const rowXPaths = [
-      "//div[contains(@class,'o_notebook')]//table[contains(@class,'o_list_table')]//tr[contains(@class,'o_data_row')]",
-      "//div[contains(@class,'o_notebook')]//tbody/tr[contains(@class,'o_data_row')]",
-    ];
-    let row = null;
-    for (const xp of rowXPaths) {
-      const rows = await this.driver.findElements(By.xpath(xp));
-      if (rows.length) {
-        row = rows[0];
-        break;
-      }
-    }
-    if (!row) {
-      throw new Error("Baris Request tidak ditemukan pada form tiket");
-    }
-
-    await this.scrollIntoView(row);
-    try {
-      await this.driver
-        .actions({ bridge: true })
-        .move({ origin: row })
-        .doubleClick()
-        .perform();
-    } catch (e) {
-      try {
-        await row.click();
-        await this.driver.sleep(200);
-        await this.driver
-          .actions({ bridge: true })
-          .sendKeys(Key.RETURN)
-          .perform();
-      } catch (e2) {}
-    }
-
-    // Wait for Open: Request modal
-    await this.driver
-      .wait(until.elementLocated(By.css(".modal-content")), 8000)
-      .catch(() => {});
-    await this.driver.sleep(300);
-  }
-
-  async performAssignment(ticketIdentifier, assignment = {}) {
-    logger.info(`Starting assignment for ticket: ${ticketIdentifier}`);
-
-    // Ensure Open Request modal is open
-    let modals = await this.driver.findElements(By.css(".modal-content"));
-    if (!modals.length) {
-      await this.openFirstRequestLineModalFromForm();
-      modals = await this.driver.findElements(By.css(".modal-content"));
-    }
-    if (!modals.length) {
-      throw new Error('Modal "Open: Request" tidak ditemukan sebelum Assign');
-    }
-
-    // Click Assign button inside Open: Request modal
-    const openReqModal = await this.getLatestModal();
-    let assignClicked = false;
-    const assignXPaths = [
-      ".//button[normalize-space(.)='Assign' or contains(normalize-space(.), 'Assign')]",
-      ".//*[self::button or self::a][contains(normalize-space(.), 'Assign')]",
-    ];
-    for (const xp of assignXPaths) {
-      const btns = await openReqModal.findElements(By.xpath(xp));
-      if (btns.length) {
-        try {
-          await btns[0].click();
-          assignClicked = true;
-          break;
-        } catch (e) {}
-      }
-    }
-    if (!assignClicked) {
-      throw new Error("Tombol Assign tidak ditemukan pada form Request");
-    }
-
-    // Wait for Assign modal to appear on top
-    await this.driver
-      .wait(until.elementLocated(By.css(".modal-content")), 8000)
-      .catch(() => {});
-    await this.driver.sleep(400);
-
-    const modal = await this.getLatestModal();
-
-    const description = await this.getTicketDescriptionText();
-    const titleGuess = guessTitle(description || "");
-    const noteGuess = guessHelpdeskNote(description || "");
-    const bobotGuess = guessBobot(description || "");
-
-    const bannedTextRowKeywords = [
-      "teams",
-      "team",
-      "pic",
-      "impact",
-      "urgency",
-      "request",
-      "type request",
-      "tipe request",
-      "masalah",
-      "category",
-      "kategori",
-      "master",
-      "system",
-      "sistem",
-    ];
-
-    let okNote = await this.fillTextFieldByFieldNameAttr(
-      modal,
-      ["keterangan_helpdesk"],
-      noteGuess
-    );
-    if (!okNote) {
-      okNote = await this.fillTextFieldByNameCandidates(
-        modal,
-        ["keterangan_helpdesk", "helpdesk_note", "helpdesk"],
-        noteGuess,
-        bannedTextRowKeywords
-      );
-    }
-    if (!okNote) {
-      okNote = await this.safeFillTextFieldInModal(
-        modal,
-        ["Keterangan Helpdesk", "Helpdesk Note"],
-        noteGuess
-      );
-    }
-
-    // Odoo often re-renders the modal after typing into Keterangan Helpdesk.
-    // Refresh modal reference to avoid stale element issues for subsequent fields.
-    await this.driver.sleep(300);
-    let modalAfterNote = modal;
-    try {
-      modalAfterNote = await this.getLatestModal();
-    } catch (e) {}
-
-    const okTitle = await this.fillTitleFieldInAssignModal(
-      modalAfterNote,
-      titleGuess
-    );
-    const okTeams = await this.safeSelectDropdownInModal(
-      modalAfterNote,
-      ["Teams", "Team"],
-      "IT HELPDESK SS"
-    );
-    let okBobot = false;
-    try {
-      okBobot = await this.selectBobotDropdown(modalAfterNote, bobotGuess);
-    } catch (e) {}
-    if (!okBobot) {
-      okBobot = await this.safeSelectDropdownInModal(
-        modalAfterNote,
-        ["Bobot", "Difficulty"],
-        bobotGuess
-      );
-    }
-
-    const okPic = assignment.pic
-      ? await this.safeSelectDropdownInModal(
-          modalAfterNote,
-          ["PIC", "PIC Helpdesk"],
-          assignment.pic
-        )
-      : false;
-    const okImpact = assignment.impact
-      ? await this.safeSelectDropdownInModal(
-          modalAfterNote,
-          ["Impact"],
-          assignment.impact
-        )
-      : false;
-
-    let okUrgency = false;
-    if (assignment.urgency) {
-      // Prefer explicit Urgency dropdown helper that clicks the o_dropdown_button
-      okUrgency = await this.selectUrgencyDropdown(
-        modalAfterNote,
-        assignment.urgency
-      );
-      if (!okUrgency) {
-        okUrgency = await this.safeSelectDropdownInModal(
-          modalAfterNote,
-          ["Urgency", "Urgensi"],
-          assignment.urgency
-        );
-      }
-    }
-
-    // Nudge Urgency to ensure SLA/OLA onchange is triggered in Odoo
-    if (okUrgency && assignment.urgency) {
-      try {
-        const current = (assignment.urgency || "").toLowerCase();
-        let alt = "Medium";
-        if (current === "medium") alt = "High";
-        else if (current === "high") alt = "Low";
-
-        // Toggle to alternate value then back to requested one, using the same dropdown UI
-        await this.selectUrgencyDropdown(modalAfterNote, alt);
-        await this.driver.sleep(300);
-        await this.selectUrgencyDropdown(modalAfterNote, assignment.urgency);
-        await this.driver.sleep(500);
-      } catch (e) {
-        logger.warn("Failed to toggle urgency to trigger SLA/OLA", {
-          message: e.message,
-        });
-      }
-    }
-
-    if (!okNote) {
-      const byPh = await this.fillTextareaByPlaceholder(
-        modal,
-        ["keterangan", "helpdesk", "note", "deskripsi", "description"],
-        noteGuess
-      );
-      if (byPh) okNote = true;
-    }
-    if (!okNote) {
-      const fbNote = await this.fillFirstEmptyTextarea(
-        modal,
-        noteGuess,
-        bannedTextRowKeywords
-      );
-      if (fbNote) okNote = true;
-    }
-
-    logger.info("Assignment modal fill status", {
-      note: okNote,
-      title: okTitle,
-      teams: okTeams,
-      bobot: okBobot,
-      pic: okPic,
-      impact: okImpact,
-      urgency: okUrgency,
-    });
-
-    let saved = false;
-    for (const label of ["Save", "Simpan", "OK"]) {
-      try {
-        await this.clickButtonInModal(modalAfterNote, label);
-        saved = true;
-        break;
-      } catch (e) {}
-    }
-    if (!saved) {
-      logger.warn(
-        "Save button for assignment modal not found; assignment may not be applied"
-      );
-    }
-
-    let started = false;
-    if (saved) {
-      try {
-        await this.driver.wait(async () => {
-          const modalsAfter = await this.driver.findElements(
-            By.css(".modal-content")
-          );
-          return modalsAfter.length === 0;
-        }, 5000);
-      } catch (e) {}
-
-      started = await this.clickStartButtonRobust();
-      if (!started) {
-        logger.warn(
-          "Start button not found after assignment; ticket may not be started automatically"
-        );
-      }
-    } else {
-      logger.warn("Skip Start because assignment modal was not saved");
-    }
-
-    return { saved, started };
-  }
-
-  async claimTicket(ticketIdentifier, assignment = null) {
-    try {
-      let assignmentAttempted = false;
-      let assignmentCompleted = false;
-      let assignmentError = null;
-
-      if (this.driver) {
-        try {
-          await this.driver.quit();
-        } catch (e) {
-          logger.warn("Failed to close old driver:", e.message);
-        }
-        this.driver = null;
-        this.isLoggedIn = false;
-      }
-
-      await this.initialize();
-      await this.login();
-
-      logger.info(`Attempting to RFA ticket: ${ticketIdentifier}`);
-
-      // 1) Open Request Form via app switcher and ensure content isn't Discuss
-      logger.info("Opening Request Form (list view) via app switcher");
-      await this.ensureRequestFormListReady();
-
-      // 2) Clear any active search facets/templates
-      try {
-        const cp = await this.driver.findElement(
-          By.xpath(
-            "//div[contains(@class,'o_control_panel')][.//ol[contains(@class,'breadcrumb')]//li[contains(normalize-space(.), 'Request Form')]]"
-          )
-        );
-        const removes = await cp.findElements(
-          By.css(".o_searchview .o_facet_remove")
-        );
-        for (const rm of removes) {
-          try {
-            await rm.click();
-            await this.driver.sleep(200);
-          } catch (e) {}
-        }
-        // Ensure specific favorite 'Request Form Final' is cleared
-        const rff = await cp.findElements(
-          By.xpath(
-            ".//div[contains(@class,'o_searchview_facet')][.//*[contains(normalize-space(.), 'Request Form Final')]]//i[contains(@class,'o_facet_remove')]"
-          )
-        );
-        for (const x of rff) {
-          try {
-            await x.click();
-            await this.driver.sleep(200);
-          } catch (e) {}
-        }
-      } catch (e) {
-        logger.warn("No search facets to clear");
-      }
-      await this.driver.sleep(300);
-
-      // 3) Preferred path: LIST VIEW ONLY (clear favorites, pick 'Nomor Ticket for', open row)
-      let opened = false;
-      try {
-        logger.info(
-          'Searching in Request Form list view using "Nomor Ticket for"'
-        );
-        const searchInput = await this.getSearchInputForTitle("Request Form");
-        try {
-          await this.scrollIntoView(searchInput);
-        } catch (e) {}
-        let clickedSug = false;
-        for (let i = 0; i < 3 && !clickedSug; i++) {
-          await searchInput.click();
-          await this.driver.sleep(150);
-          await searchInput.clear().catch(() => {});
-          await searchInput.sendKeys(ticketIdentifier);
-          await this.driver.sleep(700);
-          clickedSug = await this.pickSearchSuggestion(
-            ["Search Nomor Ticket for", "Search Nomor Ticket Detail for"],
-            ticketIdentifier,
-            7000,
-            true
-          );
-        }
-        if (!clickedSug)
-          throw new Error(
-            'Suggestion "Nomor Ticket" tidak muncul di list view'
-          );
-        await this.driver.sleep(1300);
-
-        // Open the single result row
-        await this.openListRowAndWaitForm(ticketIdentifier);
-        opened = true;
-      } catch (e) {
-        logger.warn(
-          "List search path failed, fallback to Request Detail (kanban)",
-          { message: e.message }
-        );
-      }
-
-      // No kanban fallback per user preference
-
-      // Ensure we are on form view before attempting RFA
-      await this.waitForFormView();
-      logger.info(`Ticket ${ticketIdentifier} opened, clicking RFA`);
-      await this.clickRfaButtonRobust();
-      logger.info(`Successfully clicked RFA for ticket: ${ticketIdentifier}`);
-
-      let startedAfterAssign = false;
-      if (assignment && Object.keys(assignment).length) {
-        assignmentAttempted = true;
-        try {
-          const assignResult = await this.performAssignment(
-            ticketIdentifier,
-            assignment
-          );
-          assignmentCompleted = !!(assignResult && assignResult.saved);
-          startedAfterAssign = !!(assignResult && assignResult.started);
-          if (assignmentCompleted) {
-            logger.info(
-              `Successfully assigned ticket: ${ticketIdentifier} (saved=${assignResult.saved}, started=${assignResult.started})`
-            );
-          } else {
-            logger.warn(
-              `Assignment for ticket ${ticketIdentifier} did not save correctly`
-            );
-          }
-        } catch (e) {
-          assignmentError = e;
-          logger.error(`Assignment failed for ticket ${ticketIdentifier}`, e);
-        }
-      }
-
-      if (assignmentAttempted && !assignmentCompleted) {
-        return {
-          success: false,
-          message: `⚠️ Tiket "${ticketIdentifier}" sudah di-RFA, tetapi gagal assign di Koprol.\n⚠️ Error: ${
-            assignmentError ? assignmentError.message : "Unknown error"
-          }`,
-          ticketId: ticketIdentifier,
-        };
-      }
-
-      let msg;
-      if (assignmentCompleted && startedAfterAssign) {
-        msg = `✅ Tiket "${ticketIdentifier}" berhasil di-RFA dan di-assign!\n🚀 Ticket sudah di-Start untuk Teams IT HELPDESK SS`;
-      } else if (assignmentCompleted && !startedAfterAssign) {
-        msg = `✅ Tiket "${ticketIdentifier}" berhasil di-RFA dan di-assign!\n⚠️ Namun ticket *BELUM* di-Start otomatis. Mohon cek dan Start manual di Koprol.`;
-      } else {
-        msg = `✅ Tiket "${ticketIdentifier}" berhasil di-RFA!\n📤 Status: Moved to Approved column\n⏱️ Waiting for approval`;
-      }
-
-      return {
-        success: true,
-        assigned: !!assignmentCompleted,
-        started: !!startedAfterAssign,
-        message: msg,
-        ticketId: ticketIdentifier,
-      };
-    } catch (error) {
-      logger.error(`Failed to RFA/assign ticket: ${ticketIdentifier}`, error);
-
-      return {
-        success: false,
-        message: `❌ Gagal memproses tiket "${ticketIdentifier}" (RFA/assign)\n⚠️ Error: ${error.message}\n\n💡 Pastikan tiket ada di kolom Draft`,
-        ticketId: ticketIdentifier,
-      };
-    }
+    return {
+      ok: true,
+      statusUrl,
+      rating: safeRating,
+      action,
+      comment,
+    };
   }
 
   async close() {

@@ -21,4 +21,14 @@ module.exports = {
   notification: {
     khatarPhone: process.env.KHATAR_PHONE || "62895364520814",
   },
+  // Nomor WhatsApp per PIC untuk notifikasi otomatis
+  picPhones: {
+    ANGGRIONO: process.env.PIC_ANGGRIONO_PHONE || "",
+    "DEO HERNOWO": process.env.PIC_DEO_HERNOWO_PHONE || "",
+    "ERICK INDRA TARA": process.env.PIC_ERICK_INDRA_TARA_PHONE || "",
+    "MAULIGA PENYEJUKNATE": process.env.PIC_MAULIGA_PENYEJUKNATE_PHONE || "",
+    "MOHAMAD KHATAR MALAYKI": process.env.PIC_MOHAMAD_KHATAR_MALAYKI_PHONE || "",
+    "MUHAMAD RUBYANSYAH PUTRA": process.env.PIC_MUHAMAD_RUBYANSYAH_PUTRA_PHONE || "",
+    "MUHAMMAD RISALDI": process.env.PIC_MUHAMMAD_RISALDI_PHONE || "",
+  },
 };
